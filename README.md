@@ -28,6 +28,11 @@ export MODEL=~/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 MEM_MAX=6G NTOK=64 ./run.sh <modo>
 ```
 
+Modos de I/O do pager: `sync` (v1, o handler lê e copia cada fatia em sequência), `parallel` (v2, as fatias
+gate/up/down de um expert são lidas em paralelo por um pool de threads, leitura sobreposta à cópia) e `async`
+(v3, o handler despacha cada fault pro pool e volta a ler o uffd: várias cargas de experts em voo, fatias em
+blocos de `PAGER_BLOCK_KB`; um segundo fault num expert em carga espera o bloco dele, sem recarregar).
+
 | modo | o que faz |
 |---|---|
 | `baseline` | mmap normal via `libnopopulate`: o kernel decide (sem populate/WILLNEED na carga) |
@@ -36,7 +41,8 @@ MEM_MAX=6G NTOK=64 ./run.sh <modo>
 | `trace` | `libpager` gravando o trace completo de acessos (`results/trace-*/trace.csv`) |
 | `fifo` | `libpager` com orçamento fixo de experts (`BUDGET_MB`) e despejo FIFO |
 
-Variáveis: `MEM_MAX` (teto do cgroup), `BUDGET_MB`, `NTOK`, `PAGER_IO=sync|parallel`, `PAGER_IO_THREADS`,
+Variáveis: `MEM_MAX` (teto do cgroup), `BUDGET_MB`, `NTOK`, `PAGER_IO=sync|parallel|async`, `PAGER_IO_THREADS`,
+`PAGER_BLOCK_KB` (async),
 `TIMEOUT` (SIGINT; o llama ainda imprime as estatísticas). Cada rodada parte do page cache frio
 (`posix_fadvise` + `fincore`) e grava em `results/<modo>-<data>/` o `summary.txt`, o `llama.log`, o
 `time.txt` e o `memory.events`/`memory.peak` do scope. `run_all.sh` roda a sequência da rodada 1.

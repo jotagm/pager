@@ -20,7 +20,12 @@
 //     sync    : v1 — o handler lê e copia cada fatia em sequência
 //     parallel: v2 — um pool de threads lê as fatias (gate/up/down, e blocos de 8 MB dos tensores
 //               fixos) em paralelo; cada worker faz pread + UFFDIO_COPY, sobrepondo leitura e cópia
-//   PAGER_IO_THREADS workers do modo parallel (default: 4)
+//     async   : v3 — o handler despacha cada fault de expert pro pool e volta a ler o uffd na hora:
+//               faults de threads diferentes carregam experts diferentes ao mesmo tempo. Fatias em
+//               blocos de PAGER_BLOCK_KB; o UFFDIO_COPY de cada bloco acorda quem espera naquela página.
+//               Um segundo fault num expert já em carga não recarrega: espera o bloco dele chegar.
+//   PAGER_IO_THREADS workers dos modos parallel/async (default: 4)
+//   PAGER_BLOCK_KB   tamanho do bloco de leitura no modo async (default: 256)
 //   PAGER_VERBOSE    1 = imprime detalhes no stderr
 
 #define _GNU_SOURCE
@@ -71,6 +76,9 @@ typedef struct {
     int nslices; slice_t sl[MAX_SLICES];
     uint64_t bytes;              // bytes de páginas internas (contabilizadas no orçamento)
     int resident;
+    int loading;                 // async: carga em voo (o FIFO não despeja)
+    int pending;                 // async: blocos que faltam
+    uint64_t t_submit, step_submit, load_bytes;   // load_bytes: intervalo lido (com bordas), igual ao log do v1/v2
     int prev, next;              // fila FIFO
 } unit_t;
 
@@ -102,7 +110,9 @@ static FILE *logf_;
 // estado
 static uint64_t used, pinned_bytes, step, nloads, nevict, bytes_read, io_us, nunknown;
 static uint64_t load_us;              // tempo de relógio do handler carregando (leitura + cópia)
-static int io_parallel, nworkers = 4;
+static int io_parallel, io_async, nworkers = 4;
+static uint64_t block_bytes = 256 << 10;
+static uint64_t nwait;                // async: faults num expert que já estava em carga
 static int last_layer = -1;
 static int q_head = -1, q_tail = -1;   // FIFO de experts residentes
 static char *iobuf;
@@ -300,19 +310,36 @@ static void load_file_range(region_t *g, uint64_t a, uint64_t b) {   // a,b alin
 }
 
 // ---------------------------------------------------------------- pool de I/O (PAGER_IO=parallel)
-#define QN 4096
-typedef struct { region_t *g; uint64_t a, b; } job_t;
+#define QN 16384
+typedef struct { region_t *g; uint64_t a, b; int ui; } job_t;   // ui >= 0: bloco de uma carga async
 static job_t jobq[QN];
 static int jq_head, jq_count, jq_pending;
 static pthread_mutex_t jq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jq_cv = PTHREAD_COND_INITIALIZER, jq_space = PTHREAD_COND_INITIALIZER,
                       jq_done = PTHREAD_COND_INITIALIZER;
+static int inflight;                  // async: unidades em carga
+static uint64_t busy_t0;              // async: início do período com >= 1 carga em voo
+
+static void log_load_at(unit_t *u, uint64_t st, uint64_t bytes, uint64_t us) {
+    if (logf_) fprintf(logf_, "%llu,%d,%d,%llu,%llu\n", (unsigned long long)st, u->layer, u->expert,
+                       (unsigned long long)bytes, (unsigned long long)us);
+}
+
+static void unit_done(int ui) {       // chamado pelo worker que copiou o último bloco
+    unit_t *u = &U[ui];
+    log_load_at(u, u->step_submit, u->load_bytes, now_us() - u->t_submit);
+    __atomic_store_n(&u->resident, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&u->loading, 0, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&jq_mu);
+    if (--inflight == 0) load_us += now_us() - busy_t0;
+    pthread_mutex_unlock(&jq_mu);
+}
 
 static void *io_worker(void *arg) {
     (void)arg;
     sigset_t all; sigfillset(&all); pthread_sigmask(SIG_BLOCK, &all, NULL);
     char *buf;
-    if (posix_memalign((void **)&buf, PG, CHUNK)) return NULL;
+    if (posix_memalign((void **)&buf, PG, CHUNK)) return NULL;   // block_bytes <= CHUNK
     for (;;) {
         pthread_mutex_lock(&jq_mu);
         while (!jq_count) pthread_cond_wait(&jq_cv, &jq_mu);
@@ -320,7 +347,11 @@ static void *io_worker(void *arg) {
         pthread_cond_signal(&jq_space);
         pthread_mutex_unlock(&jq_mu);
         read_file(j.g, j.a, j.b - j.a, buf);
-        uffd_copy(j.g->base + j.a, buf, j.b - j.a);
+        uffd_copy(j.g->base + j.a, buf, j.b - j.a);       // mode=0: acorda quem espera nessas páginas
+        if (j.ui >= 0) {
+            if (__atomic_sub_fetch(&U[j.ui].pending, 1, __ATOMIC_ACQ_REL) == 0) unit_done(j.ui);
+            continue;
+        }
         pthread_mutex_lock(&jq_mu);
         if (--jq_pending == 0) pthread_cond_signal(&jq_done);
         pthread_mutex_unlock(&jq_mu);
@@ -333,7 +364,7 @@ static void submit(region_t *g, uint64_t a, uint64_t b) {     // a,b alinhados a
     for (uint64_t p = a; p < b; p += CHUNK) {
         pthread_mutex_lock(&jq_mu);
         while (jq_count == QN) pthread_cond_wait(&jq_space, &jq_mu);
-        jobq[(jq_head + jq_count) % QN] = (job_t){ g, p, b - p < CHUNK ? b : p + CHUNK };
+        jobq[(jq_head + jq_count) % QN] = (job_t){ g, p, b - p < CHUNK ? b : p + CHUNK, -1 };
         jq_count++; jq_pending++;
         pthread_cond_signal(&jq_cv);
         pthread_mutex_unlock(&jq_mu);
@@ -344,6 +375,40 @@ static void wait_jobs(void) {
     pthread_mutex_lock(&jq_mu);
     while (jq_pending) pthread_cond_wait(&jq_done, &jq_mu);
     pthread_mutex_unlock(&jq_mu);
+}
+
+static void enqueue(job_t j) {
+    pthread_mutex_lock(&jq_mu);
+    while (jq_count == QN) pthread_cond_wait(&jq_space, &jq_mu);
+    jobq[(jq_head + jq_count) % QN] = j;
+    jq_count++;
+    pthread_cond_signal(&jq_cv);
+    pthread_mutex_unlock(&jq_mu);
+}
+
+// async: despacha a unidade inteira em blocos e retorna sem esperar.
+static void submit_unit(region_t *g, int ui) {
+    unit_t *u = &U[ui];
+    int n = 0;
+    u->load_bytes = 0;
+    for (int s = 0; s < u->nslices; s++) {
+        uint64_t a = pg_down(u->sl[s].off), b = pg_up(u->sl[s].off + u->sl[s].len);
+        if (b > g->len) b = pg_up(g->len);
+        if (b > a) { n += (int)((b - a + block_bytes - 1) / block_bytes); u->load_bytes += b - a; }
+    }
+    if (!n) { __atomic_store_n(&u->resident, 1, __ATOMIC_RELEASE); return; }
+    u->t_submit = now_us(); u->step_submit = step;
+    __atomic_store_n(&u->pending, n, __ATOMIC_RELEASE);   // antes de qualquer bloco entrar na fila
+    __atomic_store_n(&u->loading, 1, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&jq_mu);
+    if (inflight++ == 0) busy_t0 = now_us();
+    pthread_mutex_unlock(&jq_mu);
+    for (int s = 0; s < u->nslices; s++) {
+        uint64_t a = pg_down(u->sl[s].off), b = pg_up(u->sl[s].off + u->sl[s].len);
+        if (b > g->len) b = pg_up(g->len);
+        for (uint64_t p = a; p < b; p += block_bytes)
+            enqueue((job_t){ g, p, b - p < block_bytes ? b : p + block_bytes, ui });
+    }
 }
 
 static void q_remove(int i) {
@@ -366,6 +431,13 @@ static void evict(int i) {
     }
     u->resident = 0; used -= u->bytes; nevict++;
     q_remove(i);
+}
+
+// Despeja o mais antigo que não esteja em carga (no sync/parallel nunca há carga em voo: é o head).
+static int evict_oldest(void) {
+    for (int i = q_head; i >= 0; i = U[i].next)
+        if (!__atomic_load_n(&U[i].loading, __ATOMIC_ACQUIRE)) { evict(i); return 1; }
+    return 0;
 }
 
 static void log_load(unit_t *u, uint64_t bytes, uint64_t us) {
@@ -392,7 +464,11 @@ static void handle_fault(uint64_t addr) {
     uint64_t off = addr - (uint64_t)g->base;
     int ui = find_unit(g, off);
 
-    if (ui < 0 || U[ui].resident) {             // header/padding, ou página de borda: só a página
+    if (ui >= 0 && io_async && __atomic_load_n(&U[ui].loading, __ATOMIC_ACQUIRE)) {
+        nwait++;                                 // já em carga: o UFFDIO_COPY do bloco acorda a thread
+        return;
+    }
+    if (ui < 0 || __atomic_load_n(&U[ui].resident, __ATOMIC_ACQUIRE)) {   // header/padding, ou página de borda
         uint64_t tp = now_us();
         load_file_range(g, pg_down(off), pg_down(off) + PG);
         load_us += now_us() - tp;
@@ -403,14 +479,21 @@ static void handle_fault(uint64_t addr) {
     if (u->expert >= 0) {
         if (u->layer < last_layer) {             // camada voltou -> novo token (passo)
             step++;
-            if (!mode_fifo) while (q_head >= 0) evict(q_head);
+            if (!mode_fifo) while (evict_oldest()) ;
         }
         last_layer = u->layer;
         // Também no trace: o passo do prompt toca milhares de experts (~7,5 GB no Qwen3.6 com 97 tokens)
         // e estoura o MemoryMax se nada for despejado antes da troca de token. Nos passos de geração o
         // conjunto do token (~590 MB) cabe no orçamento, então o trace desses passos continua completo;
         // só o passo 0 pode ter recargas, e o simulate.py o descarta (--skip 1).
-        while (used + u->bytes > budget && q_head >= 0) evict(q_head);
+        while (used + u->bytes > budget && evict_oldest()) ;
+    }
+    if (io_async) {
+        nloads++;
+        if (u->expert >= 0) { used += u->bytes; q_push(ui); }
+        else pinned_bytes += u->bytes;
+        submit_unit(g, ui);
+        return;                                  // sem UFFDIO_WAKE: a cópia do bloco acorda
     }
     uint64_t t0 = now_us(), total = 0;
     for (int s = 0; s < u->nslices; s++) {
@@ -471,15 +554,20 @@ static int init_uffd(void) {
     budget = (uint64_t)(getenv("PAGER_BUDGET_MB") ? atoll(getenv("PAGER_BUDGET_MB")) : 3072) << 20;
     if (getenv("PAGER_DIRECT")) use_direct = atoi(getenv("PAGER_DIRECT"));
     io_parallel = getenv("PAGER_IO") && !strcmp(getenv("PAGER_IO"), "parallel");
+    io_async = getenv("PAGER_IO") && !strcmp(getenv("PAGER_IO"), "async");
+    if (getenv("PAGER_BLOCK_KB")) block_bytes = pg_up((uint64_t)atoll(getenv("PAGER_BLOCK_KB")) << 10);
+    if (block_bytes < PG) block_bytes = PG;
+    if (block_bytes > CHUNK) block_bytes = CHUNK;
     if (getenv("PAGER_IO_THREADS")) nworkers = atoi(getenv("PAGER_IO_THREADS"));
     if (nworkers < 1) nworkers = 1;
     const char *lp = getenv("PAGER_LOG") ? getenv("PAGER_LOG") : "pager_trace.csv";
     logf_ = fopen(lp, "w");
     if (logf_) fprintf(logf_, "step,layer,expert,bytes,load_us\n");
     if (posix_memalign((void **)&iobuf, PG, CHUNK)) return -1;
-    fprintf(stderr, "[pager] modo=%s orçamento=%llu MB direct=%d io=%s threads_io=%d log=%s\n",
+    fprintf(stderr, "[pager] modo=%s orçamento=%llu MB direct=%d io=%s threads_io=%d bloco=%llu KB log=%s\n",
             mode_fifo ? "fifo" : "trace", (unsigned long long)(budget >> 20), use_direct,
-            io_parallel ? "parallel" : "sync", io_parallel ? nworkers : 0, lp);
+            io_async ? "async" : io_parallel ? "parallel" : "sync", (io_parallel || io_async) ? nworkers : 0,
+            (unsigned long long)(io_async ? block_bytes >> 10 : 0), lp);
     return 0;
 }
 
@@ -487,10 +575,11 @@ static void report(void) {
     if (logf_) fflush(logf_);
     if (!nregions) return;
     fprintf(stderr, "[pager] passos=%llu cargas=%llu despejos=%llu lidos=%.2f GB io=%.1f s carga=%.1f s "
-            "(%.0f MB/s) io_modo=%s experts_residentes=%.0f MB fixos=%.0f MB paginas_avulsas=%llu\n",
+            "(%.0f MB/s) io_modo=%s faults_em_carga=%llu experts_residentes=%.0f MB fixos=%.0f MB paginas_avulsas=%llu\n",
             (unsigned long long)step, (unsigned long long)nloads, (unsigned long long)nevict,
             bytes_read / 1e9, io_us / 1e6, load_us / 1e6, load_us ? bytes_read / (double)load_us : 0.0,
-            io_parallel ? "parallel" : "sync", used / 1048576.0, pinned_bytes / 1048576.0,
+            io_async ? "async" : io_parallel ? "parallel" : "sync", (unsigned long long)nwait,
+            used / 1048576.0, pinned_bytes / 1048576.0,
             (unsigned long long)nunknown);
 }
 
@@ -531,7 +620,8 @@ static void *setup_region(int fd, size_t len) {
     }
     if (nregions == 0) {
         pthread_create(&handler_tid, NULL, handler, NULL);
-        if (io_parallel) for (int i = 0; i < nworkers; i++) { pthread_t t; pthread_create(&t, NULL, io_worker, NULL); }
+        if (io_parallel || io_async)
+            for (int i = 0; i < nworkers; i++) { pthread_t t; pthread_create(&t, NULL, io_worker, NULL); }
     }
     nregions++;
     fprintf(stderr, "[pager] interceptado %s (%.2f GB)\n", path, len / 1e9);

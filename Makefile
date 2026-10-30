@@ -13,11 +13,13 @@ test/test_reader: test/test_reader.c
 
 test: all
 	cd test && python3 gen_fake_gguf.py fake.gguf
-	set -e; cd test; for io in sync parallel; do \
-	  echo "== PAGER_IO=$$io"; \
-	  PAGER_IO=$$io PAGER_MIN_MB=0 PAGER_MODE=trace PAGER_LOG=trace.csv LD_PRELOAD=../libpager.so ./test_reader fake.gguf; \
-	  PAGER_IO=$$io PAGER_MIN_MB=0 PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_LOG=fifo.csv LD_PRELOAD=../libpager.so ./test_reader fake.gguf; \
-	  PAGER_IO=$$io PAGER_MIN_MB=0 PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_DIRECT=0 PAGER_LOG=fifo_nodirect.csv LD_PRELOAD=../libpager.so ./test_reader fake.gguf; \
+	set -e; cd test; for cfg in sync:256 parallel:256 async:256 async:4; do \
+	  io=$${cfg%:*}; blk=$${cfg#*:}; echo "== PAGER_IO=$$io PAGER_BLOCK_KB=$$blk"; \
+	  export PAGER_IO=$$io PAGER_BLOCK_KB=$$blk PAGER_MIN_MB=0 LD_PRELOAD=../libpager.so; \
+	  PAGER_MODE=trace PAGER_LOG=trace.csv ./test_reader fake.gguf; \
+	  PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_LOG=fifo.csv ./test_reader fake.gguf; \
+	  PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_DIRECT=0 PAGER_LOG=fifo_nodirect.csv ./test_reader fake.gguf; \
+	  unset LD_PRELOAD; \
 	done
 	python3 simulate.py test/trace.csv --budgets-mb 0.5,1,2 --skip 0
 
