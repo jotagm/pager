@@ -1,0 +1,9 @@
+modo=baseline mem_max=6G budget_mb=3072 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.06 tokens per second
+tempo total:  1057.1s
+lido do disco: 575.97 GB
+major faults: 212851
+RSS maximo:   3946 MB
+scope: pico=6144 MB max 399678 oom 0 oom_kill 0 
+[nopopulate] regiões .gguf=1 MAP_POPULATE removido=1 WILLNEED ignorados=1

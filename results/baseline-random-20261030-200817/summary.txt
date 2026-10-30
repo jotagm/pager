@@ -1,0 +1,9 @@
+modo=baseline-random mem_max=6G budget_mb=3072 ntok=64 threads=4 io=sync timeout=30m
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.31 tokens per second
+tempo total:  289.5s
+lido do disco: 35.04 GB
+major faults: 8493059
+RSS maximo:   5531 MB
+scope: pico=5578 MB max 0 oom 0 oom_kill 0 
+[nopopulate] regiões .gguf=1 MAP_POPULATE removido=1 WILLNEED ignorados=1 MADV_RANDOM=1

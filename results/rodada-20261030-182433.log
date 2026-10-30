@@ -1,0 +1,142 @@
+
+######## fio randread bs=2M direct iodepth=1 (18:24:33)
+fio qd=1: 922 MB/s, 439 IOPS, lat p50=2.28 ms p99=2.54 ms
+
+######## fio randread bs=2M direct iodepth=16 (18:25:03)
+fio qd=16: 1268 MB/s, 604 IOPS, lat p50=26.61 ms p99=32.90 ms
+
+######## baseline (MEM_MAX=6G, sem populate) (18:25:33)
+== baseline | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+RES  SIZE FILE
+ 0B 20,6G /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=baseline mem_max=6G budget_mb=3072 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.06 tokens per second
+tempo total:  1057.1s
+lido do disco: 575.97 GB
+major faults: 212851
+RSS maximo:   3946 MB
+scope: pico=6144 MB max 399678 oom 0 oom_kill 0 
+[nopopulate] regiões .gguf=1 MAP_POPULATE removido=1 WILLNEED ignorados=1
+resultados em /home/jota/pager-lab/results/baseline-20261030-182533
+
+######## baseline-populate (MEM_MAX=6G) (18:43:11)
+== baseline-populate | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+RES  SIZE FILE
+ 0B 20,6G /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=baseline-populate mem_max=6G budget_mb=3072 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.06 tokens per second
+tempo total:  1066.1s
+lido do disco: 596.35 GB
+major faults: 211986
+RSS maximo:   6115 MB
+scope: pico=6144 MB max 420920 oom 0 oom_kill 0 
+resultados em /home/jota/pager-lab/results/baseline-populate-20261030-184311
+
+######## trace (MEM_MAX=6G) (19:00:58)
+== trace | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+RES  SIZE FILE
+ 0B 20,6G /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+Terminado
+aviso: llama saiu com erro (veja /home/jota/pager-lab/results/trace-20261030-190058/llama.log)
+modo=trace mem_max=6G budget_mb=3072 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      ?
+tempo total:  14.1s
+lido do disco: 6.29 GB
+major faults: 
+RSS maximo:    MB
+scope: pico=? MB 
+[pager] interceptado /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22.13 GB)
+resultados em /home/jota/pager-lab/results/trace-20261030-190058
+
+######## fifo (MEM_MAX=6G BUDGET_MB=2700) (19:01:13)
+== fifo | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+RES  SIZE FILE
+ 0B 20,6G /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=fifo mem_max=6G budget_mb=2700 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      1.89 tokens per second
+tempo total:  57.4s
+lido do disco: 21.95 GB
+major faults: 3
+RSS maximo:   5469 MB
+scope: pico=5637 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.99 GB io=36.8 s experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0
+resultados em /home/jota/pager-lab/results/fifo-20261030-190113
+
+######## fifo (MEM_MAX=5G BUDGET_MB=1700) (19:02:11)
+== fifo | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=5G | disco=nvme0n1 | tokens=64
+RES  SIZE FILE
+ 0B 20,6G /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=fifo mem_max=5G budget_mb=1700 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      1.52 tokens per second
+tempo total:  64.9s
+lido do disco: 26.10 GB
+major faults: 0
+RSS maximo:   4469 MB
+scope: pico=4636 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=12719 despejos=11270 lidos=26.16 GB io=44.0 s experts_residentes=1700 MB fixos=2435 MB paginas_avulsas=0
+resultados em /home/jota/pager-lab/results/fifo-20261030-190211
+
+######## simulate.py (19:03:16)
+Traceback (most recent call last):
+  File "/home/jota/pager-lab/simulate.py", line 131, in <module>
+    main()
+    ~~~~^^
+  File "/home/jota/pager-lab/simulate.py", line 109, in main
+    acc = load(a.trace, a.skip)
+  File "/home/jota/pager-lab/simulate.py", line 24, in load
+    if int(r["expert"]) < 0: continue
+       ~~~^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: '-'
+fim: 19:03:16
+######## trace refeito (MEM_MAX=6G BUDGET_MB=2700) (19:04:27)
+== trace | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=trace mem_max=6G budget_mb=2700 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.71 tokens per second
+tempo total:  112.5s
+lido do disco: 49.70 GB
+major faults: 34
+RSS maximo:   5823 MB
+scope: pico=5869 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=24803 despejos=23974 lidos=49.57 GB io=84.5 s experts_residentes=579 MB fixos=2435 MB paginas_avulsas=0
+resultados em /home/jota/pager-lab/results/trace-20261030-190427
+######## simulate.py em results/trace-20261030-190427/trace.csv (19:06:20)
+20160 acessos, 63 tokens, 3421 experts distintos, 615.4 MB de experts por token
+
+ orçamento política  acerto  demanda/tok  prefetch/tok desperdício  disco/tok
+     512MB      lru   0.0%      615.4MB         0.0MB       0.0MB    615.4MB
+     512MB      lfu  35.4%      397.1MB         0.0MB       0.0MB    397.1MB
+     512MB   markov  63.2%      226.2MB       567.0MB     175.4MB    793.2MB
+     512MB   belady  57.7%      259.7MB         0.0MB       0.0MB    259.7MB
+
+    1024MB      lru  52.8%      290.3MB         0.0MB       0.0MB    290.3MB
+    1024MB      lfu  52.4%      292.7MB         0.0MB       0.0MB    292.7MB
+    1024MB   markov  69.1%      189.9MB       167.0MB      43.8MB    356.9MB
+    1024MB   belady  71.3%      176.6MB         0.0MB       0.0MB    176.6MB
+
+    1700MB      lru  65.1%      214.5MB         0.0MB       0.0MB    214.5MB
+    1700MB      lfu  64.1%      220.5MB         0.0MB       0.0MB    220.5MB
+    1700MB   markov  73.3%      164.2MB        67.1MB       9.5MB    231.3MB
+    1700MB   belady  77.5%      138.2MB         0.0MB       0.0MB    138.2MB
+
+    2700MB      lru  73.8%      161.2MB         0.0MB       0.0MB    161.2MB
+    2700MB      lfu  74.1%      159.0MB         0.0MB       0.0MB    159.0MB
+    2700MB   markov  76.9%      142.0MB        23.6MB       1.7MB    165.6MB
+    2700MB   belady  81.3%      115.2MB         0.0MB       0.0MB    115.2MB
+
+    4096MB      lru  79.5%      125.8MB         0.0MB       0.0MB    125.8MB
+    4096MB      lfu  80.4%      120.8MB         0.0MB       0.0MB    120.8MB
+    4096MB   markov  80.4%      120.3MB         5.9MB       0.1MB    126.2MB
+    4096MB   belady  83.0%      104.3MB         0.0MB       0.0MB    104.3MB
+

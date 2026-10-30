@@ -1,0 +1,9 @@
+# modelos e binários
+*.gguf
+*.so
+test/test_reader
+test/fake.gguf*
+test/*.csv
+# saídas grandes ou regeneráveis das rodadas
+results/**/trace.csv
+results/**/output.txt

@@ -1,0 +1,25 @@
+0.00.001.451 I llama_completion: llama backend init
+0.00.002.532 I llama_completion: load the model and apply lora adapter, if any
+0.00.431.619 I cmn          init: llama threadpool init, n_threads = 4
+0.00.436.631 I 
+0.00.436.710 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.436.712 I 
+0.00.437.263 I sampler seed: 4294967295
+0.00.437.283 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.00.437.291 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.00.437.292 I generate: n_ctx = 2048, n_batch = 2048, n_predict = 64, n_keep = 0
+0.00.437.293 I 
+4.49.259.125 I common_perf_print:    sampling time =      41.47 ms
+4.49.259.126 I common_perf_print:    samplers time =      15.80 ms /   161 tokens
+4.49.259.130 I common_perf_print:        load time =   86337.62 ms
+4.49.259.132 I common_perf_print: prompt eval time =   86336.76 ms /    97 tokens (  890.07 ms per token,     1.12 tokens per second)
+4.49.259.133 I common_perf_print:        eval time =  202441.06 ms /    63 runs   ( 3213.35 ms per token,     0.31 tokens per second)
+4.49.259.134 I common_perf_print:       total time =  288822.50 ms /   160 tokens
+4.49.259.135 I common_perf_print: unaccounted time =       3.22 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+4.49.259.136 I common_perf_print:    graphs reused =         62
+4.49.259.136 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+[nopopulate] regiões .gguf=1 MAP_POPULATE removido=1 WILLNEED ignorados=1 MADV_RANDOM=1

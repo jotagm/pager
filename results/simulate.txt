@@ -1,0 +1,28 @@
+20160 acessos, 63 tokens, 3421 experts distintos, 615.4 MB de experts por token
+
+ orçamento política  acerto  demanda/tok  prefetch/tok desperdício  disco/tok
+     512MB      lru   0.0%      615.4MB         0.0MB       0.0MB    615.4MB
+     512MB      lfu  35.4%      397.1MB         0.0MB       0.0MB    397.1MB
+     512MB   markov  63.2%      226.2MB       567.0MB     175.4MB    793.2MB
+     512MB   belady  57.7%      259.7MB         0.0MB       0.0MB    259.7MB
+
+    1024MB      lru  52.8%      290.3MB         0.0MB       0.0MB    290.3MB
+    1024MB      lfu  52.4%      292.7MB         0.0MB       0.0MB    292.7MB
+    1024MB   markov  69.1%      189.9MB       167.0MB      43.8MB    356.9MB
+    1024MB   belady  71.3%      176.6MB         0.0MB       0.0MB    176.6MB
+
+    1700MB      lru  65.1%      214.5MB         0.0MB       0.0MB    214.5MB
+    1700MB      lfu  64.1%      220.5MB         0.0MB       0.0MB    220.5MB
+    1700MB   markov  73.3%      164.2MB        67.1MB       9.5MB    231.3MB
+    1700MB   belady  77.5%      138.2MB         0.0MB       0.0MB    138.2MB
+
+    2700MB      lru  73.8%      161.2MB         0.0MB       0.0MB    161.2MB
+    2700MB      lfu  74.1%      159.0MB         0.0MB       0.0MB    159.0MB
+    2700MB   markov  76.9%      142.0MB        23.6MB       1.7MB    165.6MB
+    2700MB   belady  81.3%      115.2MB         0.0MB       0.0MB    115.2MB
+
+    4096MB      lru  79.5%      125.8MB         0.0MB       0.0MB    125.8MB
+    4096MB      lfu  80.4%      120.8MB         0.0MB       0.0MB    120.8MB
+    4096MB   markov  80.4%      120.3MB         5.9MB       0.1MB    126.2MB
+    4096MB   belady  83.0%      104.3MB         0.0MB       0.0MB    104.3MB
+

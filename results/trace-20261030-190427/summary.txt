@@ -1,0 +1,9 @@
+modo=trace mem_max=6G budget_mb=2700 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.71 tokens per second
+tempo total:  112.5s
+lido do disco: 49.70 GB
+major faults: 34
+RSS maximo:   5823 MB
+scope: pico=5869 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=24803 despejos=23974 lidos=49.57 GB io=84.5 s experts_residentes=579 MB fixos=2435 MB paginas_avulsas=0

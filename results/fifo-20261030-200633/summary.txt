@@ -1,0 +1,9 @@
+modo=fifo mem_max=6G budget_mb=2700 ntok=64 threads=4 io=sync timeout=nenhum
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      1.90 tokens per second
+tempo total:  57.3s
+lido do disco: 22.09 GB
+major faults: 34
+RSS maximo:   5465 MB
+scope: pico=5587 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.99 GB io=36.5 s carga=41.3 s (533 MB/s) io_modo=sync experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0

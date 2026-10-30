@@ -1,0 +1,40 @@
+######## fifo 2700 PAGER_IO=sync (controle) (20:06:33)
+== fifo | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=fifo mem_max=6G budget_mb=2700 ntok=64 threads=4 io=sync timeout=nenhum
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      1.90 tokens per second
+tempo total:  57.3s
+lido do disco: 22.09 GB
+major faults: 34
+RSS maximo:   5465 MB
+scope: pico=5587 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.99 GB io=36.5 s carga=41.3 s (533 MB/s) io_modo=sync experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0
+resultados em /home/jota/pager-lab/results/fifo-20261030-200633
+######## fifo 2700 PAGER_IO=parallel (20:07:30)
+== fifo | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=fifo mem_max=6G budget_mb=2700 ntok=64 threads=4 io=parallel timeout=nenhum
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      2.34 tokens per second
+tempo total:  47.0s
+lido do disco: 22.00 GB
+major faults: 6
+RSS maximo:   5492 MB
+scope: pico=5585 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.99 GB io=59.6 s carga=32.0 s (688 MB/s) io_modo=parallel experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0
+resultados em /home/jota/pager-lab/results/fifo-20261030-200730
+######## baseline-random TIMEOUT=30m (20:08:17)
+== baseline-random | modelo=Qwen3.6-35B-A3B-UD-Q4_K_M.gguf | MemoryMax=6G | disco=nvme0n1 | tokens=64
+page cache dos .gguf após o DONTNEED: 0.0 MB residentes
+modo=baseline-random mem_max=6G budget_mb=3072 ntok=64 threads=4 io=sync timeout=30m
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      0.31 tokens per second
+tempo total:  289.5s
+lido do disco: 35.04 GB
+major faults: 8493059
+RSS maximo:   5531 MB
+scope: pico=5578 MB max 0 oom 0 oom_kill 0 
+[nopopulate] regiões .gguf=1 MAP_POPULATE removido=1 WILLNEED ignorados=1 MADV_RANDOM=1
+resultados em /home/jota/pager-lab/results/baseline-random-20261030-200817
+fim: 20:13:07

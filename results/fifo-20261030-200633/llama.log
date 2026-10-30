@@ -1,0 +1,28 @@
+0.00.000.590 I llama_completion: llama backend init
+0.00.001.534 I llama_completion: load the model and apply lora adapter, if any
+[pager] modo=fifo orçamento=2700 MB direct=1 io=sync threads_io=0 log=/home/jota/pager-lab/results/fifo-20261030-200633/trace.csv
+[pager] 733 tensores (120 de experts), 40 camadas, 256 experts/camada, alinhamento 32, dados em 10990048
+[pager] interceptado /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22.13 GB)
+0.00.361.085 I cmn          init: llama threadpool init, n_threads = 4
+0.00.364.882 I 
+0.00.364.951 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.364.953 I 
+0.00.365.409 I sampler seed: 4294967295
+0.00.365.421 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.00.365.427 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.00.365.428 I generate: n_ctx = 2048, n_batch = 2048, n_predict = 64, n_keep = 0
+0.00.365.428 I 
+0.56.836.697 I common_perf_print:    sampling time =      41.18 ms
+0.56.836.698 I common_perf_print:    samplers time =      14.29 ms /   161 tokens
+0.56.836.702 I common_perf_print:        load time =   23276.26 ms
+0.56.836.705 I common_perf_print: prompt eval time =   23275.54 ms /    97 tokens (  239.95 ms per token,     4.17 tokens per second)
+0.56.836.707 I common_perf_print:        eval time =   33146.68 ms /    63 runs   (  526.14 ms per token,     1.90 tokens per second)
+0.56.836.712 I common_perf_print:       total time =   56471.82 ms /   160 tokens
+0.56.836.713 I common_perf_print: unaccounted time =       8.42 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+0.56.836.714 I common_perf_print:    graphs reused =         62
+0.56.836.714 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.99 GB io=36.5 s carga=41.3 s (533 MB/s) io_modo=sync experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0

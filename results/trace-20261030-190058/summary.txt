@@ -1,0 +1,9 @@
+modo=trace mem_max=6G budget_mb=3072 ntok=64 threads=4
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      ?
+tempo total:  14.1s
+lido do disco: 6.29 GB
+major faults: 
+RSS maximo:    MB
+scope: pico=? MB 
+[pager] interceptado /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22.13 GB)
