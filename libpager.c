@@ -180,6 +180,11 @@ static void wait_wake_range(int ui, uint64_t a, uint64_t b) {   // endereços [a
 static int prefetch_on, prefetch_k = 8;
 static uint64_t npf_issued, npf_useful, npf_wasted, npf_gen_issued, npf_gen_useful, npf_gen_wasted;
 static uint64_t npf_skipped_budget;       // previsões abandonadas por não caber sem despejar o token atual
+// Só instrumentação: prefetch por metade da geração (passos 1-32 e 33+) e madvise dos despejos do prefetch.
+static uint64_t pf_half_issued[2], pf_half_useful[2], pf_half_wasted[2];
+static int in_prefetch;                   // 1 enquanto markov_prefetch roda (st_mu)
+static uint64_t pf_madvise_ns, pf_evict_n;
+static inline int half_of_step(void) { return step >= 33; }
 static int last_layer = -1;
 static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;   // fila, orçamento e passo (handler x callback)
 static int *emap_g, emap_layers; static uint64_t emap_maxe;  // (camada, expert) -> unidade
@@ -540,11 +545,22 @@ static void q_push(int i) {
 
 static void evict(int i) {
     unit_t *u = &U[i]; region_t *g = &R[u->region];
+    struct timespec m0, m1;
+    if (in_prefetch) clock_gettime(CLOCK_MONOTONIC, &m0);
     for (int s = 0; s < u->nslices; s++) {
         uint64_t a = pg_up(u->sl[s].off), b = pg_down(u->sl[s].off + u->sl[s].len);
         if (b > a) madvise(g->base + a, b - a, MADV_DONTNEED);   // páginas de borda ficam
     }
-    if (u->pf) { npf_wasted++; if (step >= 1) npf_gen_wasted++; u->pf = 0; }
+    if (in_prefetch && step >= 1) {
+        clock_gettime(CLOCK_MONOTONIC, &m1);
+        pf_madvise_ns += (uint64_t)((m1.tv_sec - m0.tv_sec) * 1000000000LL + (m1.tv_nsec - m0.tv_nsec));
+        pf_evict_n++;
+    }
+    if (u->pf) {
+        npf_wasted++;
+        if (step >= 1) { npf_gen_wasted++; pf_half_wasted[half_of_step()]++; }
+        u->pf = 0;
+    }
     u->resident = 0; used -= u->bytes; nevict++;
     q_remove(i);
 }
@@ -568,7 +584,8 @@ static void mark_used(int ui) {
     unit_t *u = &U[ui];
     u->mark_step = step + 1;
     if (u->pf) {
-        npf_useful++; if (step >= 1) npf_gen_useful++;
+        npf_useful++;
+        if (step >= 1) { npf_gen_useful++; pf_half_useful[half_of_step()]++; }
         u->pf = 0;
         if (__atomic_load_n(&u->loading, __ATOMIC_ACQUIRE)) promote(ui);
     }
@@ -789,6 +806,16 @@ static void report(void) {
             prefetch_on ? "markov" : "desligado", prefetch_k, npf_gen_issued / gen, npf_gen_useful / gen,
             npf_gen_wasted / gen, (unsigned long long)npf_issued, (unsigned long long)npf_useful,
             (unsigned long long)npf_wasted, (unsigned long long)npf_skipped_budget, cb_pf_ns / 1e6 / gen);
+    if (prefetch_on) {
+        double h0 = step < 32 ? (double)step : 32.0, h1 = step > 32 ? (double)(step - 32) : 0.0;
+        fprintf(stderr, "[pager] prefetch_metades=passos 1-32: emitidos=%.1f uteis=%.1f desperdicados=%.1f por token | "
+                "passos 33-%llu: emitidos=%.1f uteis=%.1f desperdicados=%.1f por token | "
+                "madvise_no_prefetch=%.2f ms/token (%llu despejos) de cb_prefetch=%.2f ms/token\n",
+                pf_half_issued[0] / (h0 ? h0 : 1), pf_half_useful[0] / (h0 ? h0 : 1), pf_half_wasted[0] / (h0 ? h0 : 1),
+                (unsigned long long)step, pf_half_issued[1] / (h1 ? h1 : 1), pf_half_useful[1] / (h1 ? h1 : 1),
+                pf_half_wasted[1] / (h1 ? h1 : 1), pf_madvise_ns / 1e6 / gen, (unsigned long long)pf_evict_n,
+                cb_pf_ns / 1e6 / gen);
+    }
 }
 
 // ---------------------------------------------------------------- router (v4): bit de acesso pelo cb_eval
@@ -838,7 +865,8 @@ static void markov_prefetch(int L, const int *ids, int n) {
         while (used + u->bytes > budget) if (!evict_oldest_unmarked()) { ok = 0; break; }
         if (!ok) { npf_skipped_budget++; return; }   // nunca despeja o que o token atual já usou
         if (!submit_unit_prio(&R[u->region], ui, 1)) return;
-        nloads++; npf_issued++; if (step >= 1) npf_gen_issued++;
+        nloads++; npf_issued++;
+        if (step >= 1) { npf_gen_issued++; pf_half_issued[half_of_step()]++; }
         u->pf = 1; used += u->bytes; q_push(ui);
     }
 }
@@ -872,7 +900,9 @@ static void router_layer(int L, const int *ids, int n, const int32_t *tok, int n
     }
     if (prefetch_on && step >= 1) {              // 3) Markov: prevê L+1 (só na geração, como o simulador)
         uint64_t tp = ns_now();
+        in_prefetch = 1;
         markov_prefetch(L, ids, n);
+        in_prefetch = 0;
         cb_pf_ns += ns_now() - tp;
     }
 }
