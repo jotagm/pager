@@ -35,6 +35,14 @@ padrão só em `PAGER_MODE=lru` (`PAGER_ROUTER=0/1` muda). O resumo `[pager] rou
 token de geração, decomposto em `ask`, `lock` e `trabalho` (despejo + despacho). O `libpager` compila contra os
 headers do llama.cpp (`LLAMA_DIR`, padrão `~/llama.cpp`), do mesmo commit que vai rodar.
 
+**Espera e prefetch (v5).** Uma thread leitora carimba a chegada de cada fault; ele termina quando a thread do
+llama é acordada. `[pager] espera=` é o tempo de relógio por token com pelo menos uma thread parada, então
+tempo/token = espera + callback + cálculo, tudo medido. No modo `lru` com router e `PAGER_IO=async`, o callback da
+camada L aprende as transições L−1 → L (pares do mesmo token) e despacha os top-`PAGER_PREFETCH_K` (8) previstos
+para L+1 numa fila de prioridade baixa; um expert em prefetch que passa a ser pedido sobe pra fila de demanda, e o
+prefetch nunca despeja um expert usado no token atual. `PAGER_PREFETCH=0` reproduz o v4 no mesmo binário.
+`[pager] prefetch=` traz emitidos, úteis e desperdiçados por token.
+
 Modos de I/O do pager: `sync` (v1, o handler lê e copia cada fatia em sequência), `parallel` (v2, as fatias
 gate/up/down de um expert são lidas em paralelo por um pool de threads, leitura sobreposta à cópia) e `async`
 (v3, o handler despacha cada fault pro pool e volta a ler o uffd: várias cargas de experts em voo, fatias em

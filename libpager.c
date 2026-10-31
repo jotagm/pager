@@ -16,6 +16,11 @@
 //            intercepta llama_init_from_model e instala um cb_eval que observa ffn_moe_topk-<L>; a cada
 //            camada marca os experts escolhidos como usados e despacha a carga dos que faltam (v4)
 //   PAGER_ROUTER     1 = instala o cb_eval do router (default: 1 no modo lru, 0 nos outros)
+//   PAGER_PREFETCH   1 = prefetch Markov no callback (v5; default: 1 com lru+router+async; 0 = v4)
+//   PAGER_PREFETCH_K experts previstos por camada (default: 8)
+// Espera (v5, todos os modos): uma thread leitora carimba a chegada de cada fault; o fault termina quando a
+// thread é acordada (UFFDIO_WAKE no sync/parallel, cópia do bloco no async). espera= no resumo é o tempo de
+// relógio com pelo menos uma thread do llama parada (as threads se sincronizam a cada operação).
 //   PAGER_BUDGET_MB  orçamento dos experts no modo fifo (default: 3072)
 //   PAGER_LOG        arquivo CSV de log (default: pager_trace.csv)
 //   PAGER_DIRECT     1 = lê com O_DIRECT, sem page cache (default: 1)
@@ -84,7 +89,9 @@ typedef struct {
     int resident;
     int loading;                 // async: carga em voo (o FIFO não despeja)
     int pending;                 // async: blocos que faltam
-    uint64_t t_submit, step_submit, load_bytes;   // load_bytes: intervalo lido (com bordas), igual ao log do v1/v2
+    uint64_t t_submit, step_submit, load_bytes;
+    int pf;                      // carregado por prefetch e ainda não usado
+    uint64_t mark_step;          // step+1 do último uso marcado (0 = nunca); o prefetch não despeja os do token atual   // load_bytes: intervalo lido (com bordas), igual ao log do v1/v2
     int prev, next;              // fila FIFO
 } unit_t;
 
@@ -120,6 +127,59 @@ static uint64_t load_us;              // tempo de relógio do handler carregando
 static int io_parallel, io_async, nworkers = 4;
 static uint64_t block_bytes = 256 << 10;
 static uint64_t nwait;                // async: faults num expert que já estava em carga
+
+// v5: espera medida = da chegada do fault (thread leitora) até a thread ser acordada
+typedef struct { uint64_t addr, t; int ui; } waiter_t;
+#define WN 8192
+static waiter_t W[WN]; static int nw;
+static pthread_mutex_t w_mu = PTHREAD_MUTEX_INITIALIZER;
+static int n_waiting; static uint64_t wait_t0;
+static uint64_t wait_union_us, wait_sum_us, nwaits, wait_union_gen_us, wait_sum_gen_us, nwaits_gen, nw_overflow;
+
+static void wait_close_locked(uint64_t t, uint64_t now) {     // com w_mu
+    uint64_t d = now > t ? now - t : 0;
+    wait_sum_us += d; nwaits++;
+    if (step >= 1) { wait_sum_gen_us += d; nwaits_gen++; }
+    if (--n_waiting == 0) {
+        uint64_t u = now > wait_t0 ? now - wait_t0 : 0;
+        wait_union_us += u;
+        if (step >= 1) wait_union_gen_us += u;
+    }
+}
+static void wait_open(uint64_t t) {
+    pthread_mutex_lock(&w_mu);
+    if (n_waiting++ == 0) wait_t0 = t;
+    pthread_mutex_unlock(&w_mu);
+}
+static void wait_close(uint64_t t) {
+    pthread_mutex_lock(&w_mu);
+    wait_close_locked(t, now_us());
+    pthread_mutex_unlock(&w_mu);
+}
+// async: o fault termina quando o bloco da página for copiado. Se já foi (mincore), termina agora.
+// O worker copia ANTES de pegar w_mu e procurar esperadores, então a checagem e o registro sob w_mu não perdem nenhum.
+static void wait_register(uint64_t addr, uint64_t t, int ui) {
+    unsigned char v = 0;
+    pthread_mutex_lock(&w_mu);
+    if (mincore((void *)pg_down(addr), PG, &v) == 0 && (v & 1)) wait_close_locked(t, now_us());
+    else if (nw < WN) W[nw++] = (waiter_t){ pg_down(addr), t, ui };
+    else { nw_overflow++; wait_close_locked(t, now_us()); }
+    pthread_mutex_unlock(&w_mu);
+}
+static void wait_wake_range(int ui, uint64_t a, uint64_t b) {   // endereços [a,b) acabaram de ser copiados
+    pthread_mutex_lock(&w_mu);
+    uint64_t now = now_us();
+    for (int i = 0; i < nw; ) {
+        if (W[i].ui == ui && W[i].addr >= a && W[i].addr < b) { wait_close_locked(W[i].t, now); W[i] = W[--nw]; }
+        else i++;
+    }
+    pthread_mutex_unlock(&w_mu);
+}
+
+// v5: prefetch Markov
+static int prefetch_on, prefetch_k = 8;
+static uint64_t npf_issued, npf_useful, npf_wasted, npf_gen_issued, npf_gen_useful, npf_gen_wasted;
+static uint64_t npf_skipped_budget;       // previsões abandonadas por não caber sem despejar o token atual
 static int last_layer = -1;
 static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;   // fila, orçamento e passo (handler x callback)
 static int *emap_g, emap_layers; static uint64_t emap_maxe;  // (camada, expert) -> unidade
@@ -128,6 +188,7 @@ static uint64_t ncb, cb_ns, ncb_loads, ncb_touch;
 static uint64_t cb_ask_ns, cb_lock_ns, cb_work_ns;      // decomposição do custo (só passos de geração)
 static uint64_t cb_gen_ns;                               // custo total nos passos de geração (passo >= 1)
 static uint64_t cb_evict_ns, cb_submit_ns, cb_nevict;    // dentro do trabalho: despejos e despacho
+static uint64_t cb_pf_ns;                                // dentro do trabalho: prefetch Markov
 static uint64_t ns_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ULL + t.tv_nsec; }
 static ggml_backend_sched_eval_callback prev_cb; static void *prev_ud;
 static int q_head = -1, q_tail = -1;   // FIFO de experts residentes
@@ -334,6 +395,8 @@ static int jq_head, jq_count, jq_pending;
 static pthread_mutex_t jq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jq_cv = PTHREAD_COND_INITIALIZER, jq_space = PTHREAD_COND_INITIALIZER,
                       jq_done = PTHREAD_COND_INITIALIZER;
+#define PFN 4096
+static job_t pfq[PFN]; static int pf_count;   // fila de prefetch: os workers só pegam se a de demanda estiver vazia
 static int inflight;                  // async: unidades em carga
 static uint64_t busy_t0;              // async: início do período com >= 1 carga em voo
 
@@ -359,13 +422,19 @@ static void *io_worker(void *arg) {
     if (posix_memalign((void **)&buf, PG, CHUNK)) return NULL;   // block_bytes <= CHUNK
     for (;;) {
         pthread_mutex_lock(&jq_mu);
-        while (!jq_count) pthread_cond_wait(&jq_cv, &jq_mu);
-        job_t j = jobq[jq_head]; jq_head = (jq_head + 1) % QN; jq_count--;
-        pthread_cond_signal(&jq_space);
+        while (!jq_count && !pf_count) pthread_cond_wait(&jq_cv, &jq_mu);
+        job_t j;
+        if (jq_count) {
+            j = jobq[jq_head]; jq_head = (jq_head + 1) % QN; jq_count--;
+            pthread_cond_signal(&jq_space);
+        } else {
+            j = pfq[0]; memmove(pfq, pfq + 1, sizeof(job_t) * --pf_count);
+        }
         pthread_mutex_unlock(&jq_mu);
         read_file(j.g, j.a, j.b - j.a, buf);
         uffd_copy(j.g->base + j.a, buf, j.b - j.a);       // mode=0: acorda quem espera nessas páginas
         if (j.ui >= 0) {
+            wait_wake_range(j.ui, (uint64_t)j.g->base + j.a, (uint64_t)j.g->base + j.b);
             if (__atomic_sub_fetch(&U[j.ui].pending, 1, __ATOMIC_ACQ_REL) == 0) unit_done(j.ui);
             continue;
         }
@@ -403,8 +472,24 @@ static void enqueue(job_t j) {
     pthread_mutex_unlock(&jq_mu);
 }
 
-// async: despacha a unidade inteira em blocos e retorna sem esperar.
-static void submit_unit(region_t *g, int ui) {
+// Sobe pra fila de demanda os blocos de prefetch ainda não lidos de uma unidade que passou a ser pedida.
+static void promote(int ui) {
+    pthread_mutex_lock(&jq_mu);
+    int k = 0;
+    for (int i = 0; i < pf_count; i++) {
+        if (pfq[i].ui == ui && jq_count < QN) { jobq[(jq_head + jq_count) % QN] = pfq[i]; jq_count++; }
+        else pfq[k++] = pfq[i];
+    }
+    pf_count = k;
+    pthread_cond_broadcast(&jq_cv);
+    pthread_mutex_unlock(&jq_mu);
+}
+
+// async: despacha a unidade inteira em blocos e retorna sem esperar. prefetch=1: fila de baixa prioridade,
+// tudo ou nada (devolve 0 se não couber, sem mexer na unidade).
+static int submit_unit_prio(region_t *g, int ui, int prefetch);
+static void submit_unit(region_t *g, int ui) { submit_unit_prio(g, ui, 0); }
+static int submit_unit_prio(region_t *g, int ui, int prefetch) {
     unit_t *u = &U[ui];
     int n = 0;
     u->load_bytes = 0;
@@ -413,7 +498,13 @@ static void submit_unit(region_t *g, int ui) {
         if (b > g->len) b = pg_up(g->len);
         if (b > a) { n += (int)((b - a + block_bytes - 1) / block_bytes); u->load_bytes += b - a; }
     }
-    if (!n) { __atomic_store_n(&u->resident, 1, __ATOMIC_RELEASE); return; }
+    if (!n) { __atomic_store_n(&u->resident, 1, __ATOMIC_RELEASE); return 1; }
+    if (prefetch) {
+        pthread_mutex_lock(&jq_mu);
+        int room = pf_count + n <= PFN;
+        pthread_mutex_unlock(&jq_mu);
+        if (!room) return 0;                     // só o handler/callback (sob st_mu) enfileiram prefetch
+    }
     u->t_submit = now_us(); u->step_submit = step;
     __atomic_store_n(&u->pending, n, __ATOMIC_RELEASE);   // antes de qualquer bloco entrar na fila
     __atomic_store_n(&u->loading, 1, __ATOMIC_RELEASE);
@@ -423,9 +514,16 @@ static void submit_unit(region_t *g, int ui) {
     for (int s = 0; s < u->nslices; s++) {
         uint64_t a = pg_down(u->sl[s].off), b = pg_up(u->sl[s].off + u->sl[s].len);
         if (b > g->len) b = pg_up(g->len);
-        for (uint64_t p = a; p < b; p += block_bytes)
-            enqueue((job_t){ g, p, b - p < block_bytes ? b : p + block_bytes, ui });
+        for (uint64_t p = a; p < b; p += block_bytes) {
+            job_t j = { g, p, b - p < block_bytes ? b : p + block_bytes, ui };
+            if (!prefetch) { enqueue(j); continue; }
+            pthread_mutex_lock(&jq_mu);
+            pfq[pf_count++] = j;
+            pthread_cond_signal(&jq_cv);
+            pthread_mutex_unlock(&jq_mu);
+        }
     }
+    return 1;
 }
 
 static void q_remove(int i) {
@@ -446,6 +544,7 @@ static void evict(int i) {
         uint64_t a = pg_up(u->sl[s].off), b = pg_down(u->sl[s].off + u->sl[s].len);
         if (b > a) madvise(g->base + a, b - a, MADV_DONTNEED);   // páginas de borda ficam
     }
+    if (u->pf) { npf_wasted++; if (step >= 1) npf_gen_wasted++; u->pf = 0; }
     u->resident = 0; used -= u->bytes; nevict++;
     q_remove(i);
 }
@@ -455,6 +554,24 @@ static int evict_oldest(void) {
     for (int i = q_head; i >= 0; i = U[i].next)
         if (!__atomic_load_n(&U[i].loading, __ATOMIC_ACQUIRE)) { evict(i); return 1; }
     return 0;
+}
+
+// Prefetch: despeja o mais antigo que não esteja em carga nem tenha sido usado no token atual.
+static int evict_oldest_unmarked(void) {
+    for (int i = q_head; i >= 0; i = U[i].next)
+        if (!__atomic_load_n(&U[i].loading, __ATOMIC_ACQUIRE) && U[i].mark_step != step + 1) { evict(i); return 1; }
+    return 0;
+}
+
+// Uso de verdade de uma unidade (fault ou router): marca no token e, se veio de prefetch, conta como útil.
+static void mark_used(int ui) {
+    unit_t *u = &U[ui];
+    u->mark_step = step + 1;
+    if (u->pf) {
+        npf_useful++; if (step >= 1) npf_gen_useful++;
+        u->pf = 0;
+        if (__atomic_load_n(&u->loading, __ATOMIC_ACQUIRE)) promote(ui);
+    }
 }
 
 static void log_load(unit_t *u, uint64_t bytes, uint64_t us) {
@@ -473,23 +590,26 @@ static int find_unit(region_t *g, uint64_t off) {
     return -1;
 }
 
-static void handle_fault_locked(uint64_t addr);
-static void handle_fault(uint64_t addr) {
+static void handle_fault_locked(uint64_t addr, uint64_t t);
+static void handle_fault(uint64_t addr, uint64_t t) {
     pthread_mutex_lock(&st_mu);
-    handle_fault_locked(addr);
+    handle_fault_locked(addr, t);
     pthread_mutex_unlock(&st_mu);
 }
 
-static void handle_fault_locked(uint64_t addr) {
+// Toda saída fecha a espera do fault exatamente uma vez: wait_close (acordou aqui) ou wait_register (o worker fecha).
+static void handle_fault_locked(uint64_t addr, uint64_t t) {
     region_t *g = NULL;
     for (int i = 0; i < nregions; i++)
         if (addr >= (uint64_t)R[i].base && addr < (uint64_t)R[i].base + R[i].len) { g = &R[i]; break; }
-    if (!g) return;
+    if (!g) { wait_close(t); return; }
     uint64_t off = addr - (uint64_t)g->base;
     int ui = find_unit(g, off);
 
     if (ui >= 0 && io_async && __atomic_load_n(&U[ui].loading, __ATOMIC_ACQUIRE)) {
         nwait++;                                 // já em carga: o UFFDIO_COPY do bloco acorda a thread
+        if (U[ui].expert >= 0) mark_used(ui);    // se era prefetch, vira demanda (promove os blocos)
+        wait_register(addr, t, ui);
         return;
     }
     if (ui < 0 || __atomic_load_n(&U[ui].resident, __ATOMIC_ACQUIRE)) {   // header/padding, ou página de borda
@@ -501,6 +621,7 @@ static void handle_fault_locked(uint64_t addr) {
     }
     unit_t *u = &U[ui];
     if (u->expert >= 0) {
+        mark_used(ui);
         if (!cb_seen && u->layer < last_layer) { // camada voltou -> novo token (sem router; com ele, o passo vem do callback)
             step++;
             if (!mode_fifo) while (evict_oldest()) ;
@@ -517,6 +638,7 @@ static void handle_fault_locked(uint64_t addr) {
         if (u->expert >= 0) { used += u->bytes; q_push(ui); }
         else pinned_bytes += u->bytes;
         submit_unit(g, ui);
+        wait_register(addr, t, ui);
         return;                                  // sem UFFDIO_WAKE: a cópia do bloco acorda
     }
     uint64_t t0 = now_us(), total = 0;
@@ -534,17 +656,52 @@ static void handle_fault_locked(uint64_t addr) {
 wake:;
     struct uffdio_range wr = { .start = pg_down(addr), .len = PG };
     ioctl(uffd, UFFDIO_WAKE, &wr);
+    wait_close(t);
 }
 
-static void *handler(void *arg) {
+// Leitora: só lê o uffd e carimba a chegada (sem ela, no sync/parallel os faults esperariam na fila do
+// kernel enquanto o handler carrega, e a espera medida sairia menor que a real).
+#define FQN 4096
+static struct { uint64_t addr, t; } fq[FQN];
+static int fq_head, fq_count;
+static pthread_mutex_t fq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fq_cv = PTHREAD_COND_INITIALIZER, fq_space = PTHREAD_COND_INITIALIZER;
+static pthread_t reader_tid;
+
+static void *reader(void *arg) {
     (void)arg;
     sigset_t all; sigfillset(&all); pthread_sigmask(SIG_BLOCK, &all, NULL);
     for (;;) {
         struct uffd_msg msg[16];
         ssize_t n = read(uffd, msg, sizeof msg);
         if (n < 0) { if (errno == EINTR || errno == EAGAIN) continue; break; }
-        for (ssize_t i = 0; i < n / (ssize_t)sizeof(struct uffd_msg); i++)
-            if (msg[i].event == UFFD_EVENT_PAGEFAULT) handle_fault(msg[i].arg.pagefault.address);
+        uint64_t t = now_us();
+        for (ssize_t i = 0; i < n / (ssize_t)sizeof(struct uffd_msg); i++) {
+            if (msg[i].event != UFFD_EVENT_PAGEFAULT) continue;
+            wait_open(t);
+            pthread_mutex_lock(&fq_mu);
+            while (fq_count == FQN) pthread_cond_wait(&fq_space, &fq_mu);
+            fq[(fq_head + fq_count) % FQN].addr = msg[i].arg.pagefault.address;
+            fq[(fq_head + fq_count) % FQN].t = t;
+            fq_count++;
+            pthread_cond_signal(&fq_cv);
+            pthread_mutex_unlock(&fq_mu);
+        }
+    }
+    return NULL;
+}
+
+static void *handler(void *arg) {
+    (void)arg;
+    sigset_t all; sigfillset(&all); pthread_sigmask(SIG_BLOCK, &all, NULL);
+    for (;;) {
+        pthread_mutex_lock(&fq_mu);
+        while (!fq_count) pthread_cond_wait(&fq_cv, &fq_mu);
+        uint64_t addr = fq[fq_head].addr, t = fq[fq_head].t;
+        fq_head = (fq_head + 1) % FQN; fq_count--;
+        pthread_cond_signal(&fq_space);
+        pthread_mutex_unlock(&fq_mu);
+        handle_fault(addr, t);
         if (logf_ && nloads % 256 == 0) fflush(logf_);
     }
     return NULL;
@@ -586,6 +743,14 @@ static int init_uffd(void) {
     if (block_bytes > CHUNK) block_bytes = CHUNK;
     if (getenv("PAGER_IO_THREADS")) nworkers = atoi(getenv("PAGER_IO_THREADS"));
     if (nworkers < 1) nworkers = 1;
+    prefetch_on = getenv("PAGER_PREFETCH") ? atoi(getenv("PAGER_PREFETCH")) : (mode_lru && router_on && io_async);
+    if (prefetch_on && !(router_on && io_async)) {
+        fprintf(stderr, "[pager] PAGER_PREFETCH=1 exige router e PAGER_IO=async: prefetch desligado\n");
+        prefetch_on = 0;
+    }
+    if (getenv("PAGER_PREFETCH_K")) prefetch_k = atoi(getenv("PAGER_PREFETCH_K"));
+    if (prefetch_k < 1) prefetch_k = 1;
+    if (prefetch_k > 64) prefetch_k = 64;
     const char *lp = getenv("PAGER_LOG") ? getenv("PAGER_LOG") : "pager_trace.csv";
     logf_ = fopen(lp, "w");
     if (logf_) fprintf(logf_, "step,layer,expert,bytes,load_us\n");
@@ -615,13 +780,70 @@ static void report(void) {
             cb_gen_ns / 1e6 / gen, cb_ask_ns / 1e6 / gen, cb_lock_ns / 1e6 / gen, cb_work_ns / 1e6 / gen,
             cb_evict_ns / 1e6 / gen, (unsigned long long)cb_nevict, cb_submit_ns / 1e6 / gen,
             cb_ns / 1e6, (unsigned long long)ncb_touch, (unsigned long long)ncb_loads);
+    fprintf(stderr, "[pager] espera=%.1f ms/token (geração, relógio com >= 1 thread parada; soma=%.1f ms/token, "
+            "%.1f faults/token) espera_total=%.1f s esperadores_pendentes=%d estouro=%llu\n",
+            wait_union_gen_us / 1e3 / gen, wait_sum_gen_us / 1e3 / gen, nwaits_gen / gen,
+            wait_union_us / 1e6, nw, (unsigned long long)nw_overflow);
+    fprintf(stderr, "[pager] prefetch=%s K=%d emitidos=%.1f uteis=%.1f desperdicados=%.1f por token "
+            "(geração; total %llu/%llu/%llu) sem_orcamento=%llu cb_prefetch=%.2f ms/token\n",
+            prefetch_on ? "markov" : "desligado", prefetch_k, npf_gen_issued / gen, npf_gen_useful / gen,
+            npf_gen_wasted / gen, (unsigned long long)npf_issued, (unsigned long long)npf_useful,
+            (unsigned long long)npf_wasted, (unsigned long long)npf_skipped_budget, cb_pf_ns / 1e6 / gen);
 }
 
 // ---------------------------------------------------------------- router (v4): bit de acesso pelo cb_eval
 static int in_queue(int ui) { return U[ui].prev >= 0 || U[ui].next >= 0 || q_head == ui; }
 
 // Chamado com st_mu: experts da camada L escolhidos pelo router (ids[], n distintos).
-static void router_layer(int L, const int *ids, int n) {
+static uint16_t *trans;                          // Markov: trans[L][a][b] = vezes que a (camada L) levou a b (L+1)
+static int32_t prev_tok[8192]; static int prev_L = -1, prev_ntok, prev_nused; static uint64_t prev_step;
+
+static void markov_learn(int L, const int32_t *tok, int nused, int ntok) {
+    if (!trans) trans = calloc((size_t)emap_layers * emap_maxe * emap_maxe, sizeof(uint16_t));
+    if (!trans) return;
+    if (L >= 1 && prev_L == L - 1 && prev_step == step && prev_ntok == ntok) {
+        for (int j = 0; j < ntok; j++)               // pares do mesmo token: experts de L-1 -> experts de L
+            for (int a = 0; a < prev_nused; a++)
+                for (int b = 0; b < nused; b++) {
+                    int ea = prev_tok[j * prev_nused + a], eb = tok[j * nused + b];
+                    if (ea < 0 || eb < 0 || (uint64_t)ea >= emap_maxe || (uint64_t)eb >= emap_maxe) continue;
+                    uint16_t *c = &trans[((size_t)(L - 1) * emap_maxe + ea) * emap_maxe + eb];
+                    if (*c < UINT16_MAX) (*c)++;
+                }
+    }
+    if (nused * ntok <= (int)(sizeof prev_tok / sizeof prev_tok[0])) {
+        memcpy(prev_tok, tok, sizeof(int32_t) * nused * ntok);
+        prev_L = L; prev_ntok = ntok; prev_nused = nused; prev_step = step;
+    } else prev_L = -1;
+}
+
+// Prevê os experts de L+1 a partir dos de L e despacha os top-K com prioridade baixa.
+static void markov_prefetch(int L, const int *ids, int n) {
+    if (!trans || L + 1 >= emap_layers || L + 1 >= 40) return;
+    uint32_t votes[4096] = {0};
+    for (int i = 0; i < n; i++) {
+        const uint16_t *row = &trans[((size_t)L * emap_maxe + ids[i]) * emap_maxe];
+        for (uint64_t e = 0; e < emap_maxe; e++) votes[e] += row[e];
+    }
+    for (int k = 0; k < prefetch_k; k++) {           // seleção dos top-K com voto > 0
+        uint64_t best = 0; uint32_t bv = 0;
+        for (uint64_t e = 0; e < emap_maxe; e++) if (votes[e] > bv) { bv = votes[e]; best = e; }
+        if (!bv) break;
+        votes[best] = 0;
+        int ui = emap_g[(uint64_t)(L + 1) * emap_maxe + best];
+        if (ui < 0) continue;
+        unit_t *u = &U[ui];
+        if (__atomic_load_n(&u->resident, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->loading, __ATOMIC_ACQUIRE)) continue;
+        int ok = 1;
+        while (used + u->bytes > budget) if (!evict_oldest_unmarked()) { ok = 0; break; }
+        if (!ok) { npf_skipped_budget++; return; }   // nunca despeja o que o token atual já usou
+        if (!submit_unit_prio(&R[u->region], ui, 1)) return;
+        nloads++; npf_issued++; if (step >= 1) npf_gen_issued++;
+        u->pf = 1; used += u->bytes; q_push(ui);
+    }
+}
+
+static void router_layer(int L, const int *ids, int n, const int32_t *tok, int nused, int ntok) {
     if (L < cb_last_layer) {                     // camada voltou -> novo token
         step++;
         if (!mode_fifo) while (evict_oldest()) ;
@@ -629,8 +851,11 @@ static void router_layer(int L, const int *ids, int n) {
     cb_last_layer = L; cb_seen = 1;
     for (int i = 0; i < n; i++) {                // 1) bit de acesso: no LRU, vai pro fim da fila
         int ui = emap_g[(uint64_t)L * emap_maxe + ids[i]];
-        if (ui >= 0 && mode_lru && in_queue(ui)) { q_remove(ui); q_push(ui); ncb_touch++; }
+        if (ui < 0) continue;
+        mark_used(ui);
+        if (mode_lru && in_queue(ui)) { q_remove(ui); q_push(ui); ncb_touch++; }
     }
+    if (prefetch_on) markov_learn(L, tok, nused, ntok);
     if (!io_async) return;                       // carga antecipada só no async; nos outros, o fault carrega
     for (int i = 0; i < n; i++) {                // 2) despacha os que faltam, antes do mul_mat_id
         int ui = emap_g[(uint64_t)L * emap_maxe + ids[i]];
@@ -644,6 +869,11 @@ static void router_layer(int L, const int *ids, int n) {
         used += u->bytes; q_push(ui);
         submit_unit(&R[u->region], ui);
         if (step >= 1) { cb_evict_ns += ts - te; cb_submit_ns += ns_now() - ts; cb_nevict += nevict - ne; }
+    }
+    if (prefetch_on && step >= 1) {              // 3) Markov: prevê L+1 (só na geração, como o simulador)
+        uint64_t tp = ns_now();
+        markov_prefetch(L, ids, n);
+        cb_pf_ns += ns_now() - tp;
     }
 }
 
@@ -663,16 +893,20 @@ static bool pager_cb(struct ggml_tensor *t, bool ask, void *ud) {
     } else {
         if (mine) {
             // ffn_moe_topk é uma view do argsort: [n_expert_used, n_tokens] com strides nb[0], nb[1]
+            static int32_t tok[8192];            // só a thread principal do llama chama o callback
             int ids[1024], n = 0; unsigned char seen[4096] = {0};
+            int nused = (int)t->ne[0], ntok = (int)t->ne[1];
+            if ((int64_t)nused * ntok > (int64_t)(sizeof tok / sizeof tok[0])) ntok = (int)(sizeof tok / sizeof tok[0]) / nused;
             for (int64_t j = 0; j < t->ne[1]; j++)
                 for (int64_t i = 0; i < t->ne[0]; i++) {
                     int e = *(const int32_t *)((const char *)t->data + i * t->nb[0] + j * t->nb[1]);
+                    if (j < ntok) tok[j * nused + i] = e;
                     if (e >= 0 && (uint64_t)e < emap_maxe && e < 4096 && !seen[e] && n < 1024) { seen[e] = 1; ids[n++] = e; }
                 }
             uint64_t tl = ns_now();
             pthread_mutex_lock(&st_mu);
             uint64_t tw = ns_now();
-            router_layer(L, ids, n);
+            router_layer(L, ids, n, tok, nused, ntok);
             ncb++;
             if (step >= 1) { cb_lock_ns += tw - tl; cb_work_ns += ns_now() - tw; }
             pthread_mutex_unlock(&st_mu);
@@ -737,6 +971,7 @@ static void *setup_region(int fd, size_t len) {
     }
     if (nregions == 0) {
         pthread_create(&handler_tid, NULL, handler, NULL);
+        pthread_create(&reader_tid, NULL, reader, NULL);
         if (io_parallel || io_async)
             for (int i = 0; i < nworkers; i++) { pthread_t t; pthread_create(&t, NULL, io_worker, NULL); }
     }

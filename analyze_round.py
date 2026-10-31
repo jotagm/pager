@@ -5,6 +5,7 @@ custo do callback e a divisão do tempo por token (carga / callback / resto).
 Uso: analyze_round.py results/<rodada> [...]
 A carga por token é exata no modo sync/parallel (handler serial: soma do load_us dos passos >= 1) e
 estimada no async (bytes de experts por token ÷ MB/s de carga da rodada), porque lá as cargas se sobrepõem.
+Do v5 em diante o resumo traz espera= (medida): tempo/token = espera + callback + cálculo, sem estimativa.
 """
 import csv, re, sys
 
@@ -31,8 +32,15 @@ for d in sys.argv[1:]:
         tag = "medida"
     resto = ms_tok - carga - cb
     print(f"{d}\n  io={io_mode} tok/s={1e3/ms_tok:.2f} ms/token={ms_tok:.0f} | experts/token(geração)={mb_tok:.1f} MB "
-          f"cargas/token={len(rows)/steps:.1f} | MB/s carga={rate:.0f} | despejos={desp}\n"
-          f"  tempo/token: carga={carga:.0f} ms ({tag}, {carga/ms_tok:.0%}) callback={cb:.1f} ms ({cb/ms_tok:.0%}) "
-          f"resto/cálculo={resto:.0f} ms ({resto/ms_tok:.0%})")
-    if rt:
-        print("  " + rt.group(0))
+          f"cargas/token={len(rows)/steps:.1f} | MB/s carga={rate:.0f} | despejos={desp}")
+    esp = re.search(r"\[pager\] espera=([\d.]+) ms/token", log)
+    if esp:
+        w = float(esp.group(1)); calc = ms_tok - w - cb
+        print(f"  tempo/token (medido): espera={w:.0f} ms ({w/ms_tok:.0%}) callback={cb:.1f} ms ({cb/ms_tok:.0%}) "
+              f"cálculo={calc:.0f} ms ({calc/ms_tok:.0%}) | carga {tag}={carga:.0f} ms")
+    else:
+        print(f"  tempo/token: carga={carga:.0f} ms ({tag}, {carga/ms_tok:.0%}) callback={cb:.1f} ms ({cb/ms_tok:.0%}) "
+              f"resto/cálculo={resto:.0f} ms ({resto/ms_tok:.0%})")
+    for k in ("router", "espera", "prefetch"):
+        m = re.search(rf"\[pager\] {k}=.*", log)
+        if m: print("  " + m.group(0))
