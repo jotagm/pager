@@ -43,6 +43,16 @@ para L+1 numa fila de prioridade baixa; um expert em prefetch que passa a ser pe
 prefetch nunca despeja um expert usado no token atual. `PAGER_PREFETCH=0` reproduz o v4 no mesmo binário.
 `[pager] prefetch=` traz emitidos, úteis e desperdiçados por token.
 
+**Despejo adiado e limiar de confiança (v6).** Com `PAGER_EVICT_ASYNC=1` (padrão no async), o despejo libera o
+orçamento na hora e o `madvise(MADV_DONTNEED)` roda num worker. Um contador de geração por unidade garante que um
+madvise atrasado nunca apague um expert recarregado: antes de qualquer carga, o pager cancela o despejo ainda
+pendente (as páginas continuam lá: a unidade volta sem ler o disco, `resgatados=`) ou espera o madvise em andamento
+terminar (`esperas_madvise=`). O worker confere o invariante "nenhuma carga começou durante o madvise da unidade"
+(`violacoes=`, tem de ser 0). `test/race.sh` força essa corrida (`PAGER_EVICT_DELAY_US`, só para teste) e falha se
+houver violação, erro de byte, thread presa, ou se a corrida não tiver acontecido; com a espera removida de
+propósito, o mesmo teste falha em todos os encontros. O prefetch só emite um expert se o voto dele passar de
+`PAGER_PREFETCH_MIN` (0,04, escolhido no simulador: `simulate.py --min-frac`) dos votos da camada; `0` = K fixo (v5).
+
 Modos de I/O do pager: `sync` (v1, o handler lê e copia cada fatia em sequência), `parallel` (v2, as fatias
 gate/up/down de um expert são lidas em paralelo por um pool de threads, leitura sobreposta à cópia) e `async`
 (v3, o handler despacha cada fault pro pool e volta a ler o uffd: várias cargas de experts em voo, fatias em

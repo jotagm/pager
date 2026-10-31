@@ -1,0 +1,23 @@
+	Command being timed: "env LC_NUMERIC=C LD_PRELOAD=/home/jota/pager-lab/libpager.so PAGER_MODE=lru PAGER_BUDGET_MB=1024 PAGER_LOG=/home/jota/pager-lab/results/lru-20261031-104756/trace.csv /home/jota/llama.cpp/build/bin/llama-completion -m /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -f /home/jota/pager-lab/prompt.txt -n 8 -t 4 --no-warmup --no-repack -no-cnv --load-mode mmap --fit off -c 2048 --temp 0 --seed 1"
+	User time (seconds): 27.33
+	System time (seconds): 11.46
+	Percent of CPU this job got: 53%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:12.51
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 3871632
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1332
+	Minor (reclaiming a frame) page faults: 83204
+	Voluntary context switches: 98344
+	Involuntary context switches: 6362
+	Swaps: 0
+	File system inputs: 27309048
+	File system outputs: 304
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

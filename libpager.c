@@ -18,6 +18,14 @@
 //   PAGER_ROUTER     1 = instala o cb_eval do router (default: 1 no modo lru, 0 nos outros)
 //   PAGER_PREFETCH   1 = prefetch Markov no callback (v5; default: 1 com lru+router+async; 0 = v4)
 //   PAGER_PREFETCH_K experts previstos por camada (default: 8)
+//   PAGER_PREFETCH_MIN limiar de confiança (v6): só emite se o voto do expert >= essa fração dos votos da
+//                    camada (default: 0.04, escolhido no simulador; 0 = K fixo, como no v5)
+//   PAGER_EVICT_ASYNC 1 = madvise dos despejos num worker (v6; default: 1 no async). A contabilidade é imediata;
+//                    um contador de geração por unidade garante que um madvise atrasado nunca apague um expert
+//                    recarregado: antes de carregar, o pager cancela o despejo pendente (as páginas ainda estão
+//                    lá: volta a ser residente sem ler o disco) ou espera o madvise em andamento terminar.
+//   PAGER_EVICT_DELAY_US só para teste: o worker dorme entre as fatias do madvise (estado EV_MADVISING com parte
+//                    das páginas já apagada: a janela em que uma carga sobreposta seria um erro)
 // Espera (v5, todos os modos): uma thread leitora carimba a chegada de cada fault; o fault termina quando a
 // thread é acordada (UFFDIO_WAKE no sync/parallel, cópia do bloco no async). espera= no resumo é o tempo de
 // relógio com pelo menos uma thread do llama parada (as threads se sincronizam a cada operação).
@@ -91,7 +99,9 @@ typedef struct {
     int pending;                 // async: blocos que faltam
     uint64_t t_submit, step_submit, load_bytes;
     int pf;                      // carregado por prefetch e ainda não usado
-    uint64_t mark_step;          // step+1 do último uso marcado (0 = nunca); o prefetch não despeja os do token atual   // load_bytes: intervalo lido (com bordas), igual ao log do v1/v2
+    uint64_t mark_step;          // step+1 do último uso marcado (0 = nunca); o prefetch não despeja os do token atual
+    uint32_t gen;                // v6: muda a cada despejo e a cada resgate (ev_mu)
+    int evstate;                 // v6: 0 nada, 1 despejo pendente, 2 madvise em andamento (ev_mu)   // load_bytes: intervalo lido (com bordas), igual ao log do v1/v2
     int prev, next;              // fila FIFO
 } unit_t;
 
@@ -185,6 +195,20 @@ static uint64_t pf_half_issued[2], pf_half_useful[2], pf_half_wasted[2];
 static int in_prefetch;                   // 1 enquanto markov_prefetch roda (st_mu)
 static uint64_t pf_madvise_ns, pf_evict_n;
 static inline int half_of_step(void) { return step >= 33; }
+static double prefetch_min = 0.04;        // v6: limiar de confiança do prefetch (0 = K fixo)
+static uint64_t npf_below_min;            // previsões cortadas pelo limiar
+
+// v6: despejo adiado
+enum { EV_NONE = 0, EV_PENDING = 1, EV_MADVISING = 2 };
+typedef struct { int ui; uint32_t gen; } evjob_t;
+#define EVQ 8192
+static evjob_t evq[EVQ]; static int evq_head, evq_count, evq_max;
+static pthread_mutex_t ev_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ev_cv = PTHREAD_COND_INITIALIZER, ev_idle = PTHREAD_COND_INITIALIZER;
+static int evict_async;
+static uint64_t nev_deferred, nev_rescued, nev_waited, nev_stale, nev_sync_full, ev_madvise_ns, ev_madvise_gen_ns;
+static uint64_t nfault_resident;          // fault numa página de unidade já residente (várias threads no mesmo expert)
+static uint64_t nev_violation;            // invariante: carga iniciada durante o madvise da unidade (tem de ser 0)
 static int last_layer = -1;
 static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;   // fila, orçamento e passo (handler x callback)
 static int *emap_g, emap_layers; static uint64_t emap_maxe;  // (camada, expert) -> unidade
@@ -543,14 +567,82 @@ static void q_push(int i) {
     q_tail = i;
 }
 
-static void evict(int i) {
-    unit_t *u = &U[i]; region_t *g = &R[u->region];
-    struct timespec m0, m1;
-    if (in_prefetch) clock_gettime(CLOCK_MONOTONIC, &m0);
+static int evict_delay_us;
+static void madvise_unit(unit_t *u, int test_delay) {
+    region_t *g = &R[u->region];
     for (int s = 0; s < u->nslices; s++) {
         uint64_t a = pg_up(u->sl[s].off), b = pg_down(u->sl[s].off + u->sl[s].len);
         if (b > a) madvise(g->base + a, b - a, MADV_DONTNEED);   // páginas de borda ficam
+        // teste: dorme com parte das fatias já apagadas e o estado em EV_MADVISING (a janela perigosa)
+        if (test_delay && evict_delay_us && s + 1 < u->nslices) usleep(evict_delay_us);
     }
+}
+
+// Worker de despejo: só age se a unidade continua com o despejo pendente da MESMA geração do pedido.
+static void *evictor(void *arg) {
+    (void)arg;
+    sigset_t all; sigfillset(&all); pthread_sigmask(SIG_BLOCK, &all, NULL);
+    for (;;) {
+        pthread_mutex_lock(&ev_mu);
+        while (!evq_count) pthread_cond_wait(&ev_cv, &ev_mu);
+        evjob_t j = evq[evq_head]; evq_head = (evq_head + 1) % EVQ; evq_count--;
+        unit_t *u = &U[j.ui];
+        if (u->evstate != EV_PENDING || u->gen != j.gen) { nev_stale++; pthread_mutex_unlock(&ev_mu); continue; }
+        u->evstate = EV_MADVISING;                 // a partir daqui, quem quiser carregar espera (reclaim)
+        pthread_mutex_unlock(&ev_mu);
+        uint64_t t0 = now_us();
+        madvise_unit(u, 1);
+        uint64_t dt = (now_us() - t0) * 1000;
+        pthread_mutex_lock(&ev_mu);
+        ev_madvise_ns += dt; if (step >= 1) ev_madvise_gen_ns += dt;
+        // ninguém pode ter começado a carregar esta unidade enquanto o madvise rodava (o reclaim espera)
+        if (__atomic_load_n(&u->loading, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->resident, __ATOMIC_ACQUIRE))
+            nev_violation++;
+        u->evstate = EV_NONE;
+        pthread_cond_broadcast(&ev_idle);
+        pthread_mutex_unlock(&ev_mu);
+    }
+    return NULL;
+}
+
+// Antes de carregar uma unidade ausente (com st_mu): se o despejo ainda está pendente, cancela e a unidade
+// volta a ser residente sem ler o disco (devolve 1); se o madvise está em andamento, espera ele acabar (0).
+static void q_push(int i);
+static int reclaim(int ui) {
+    unit_t *u = &U[ui];
+    if (!evict_async) return 0;
+    pthread_mutex_lock(&ev_mu);
+    while (u->evstate == EV_MADVISING) { nev_waited++; pthread_cond_wait(&ev_idle, &ev_mu); }
+    if (u->evstate == EV_PENDING) {
+        u->evstate = EV_NONE; u->gen++;           // invalida o pedido que está na fila
+        pthread_mutex_unlock(&ev_mu);
+        __atomic_store_n(&u->resident, 1, __ATOMIC_RELEASE);
+        used += u->bytes; q_push(ui); nev_rescued++;
+        return 1;
+    }
+    pthread_mutex_unlock(&ev_mu);
+    return 0;
+}
+
+static void evict(int i) {
+    unit_t *u = &U[i];
+    int deferred = 0;
+    // deixa de ser residente ANTES de o pedido entrar na fila: o worker pode fazer o madvise na hora
+    __atomic_store_n(&u->resident, 0, __ATOMIC_RELEASE);
+    if (evict_async) {
+        pthread_mutex_lock(&ev_mu);
+        if (evq_count < EVQ) {
+            u->gen++; u->evstate = EV_PENDING;
+            evq[(evq_head + evq_count) % EVQ] = (evjob_t){ i, u->gen };
+            if (++evq_count > evq_max) evq_max = evq_count;
+            pthread_cond_signal(&ev_cv);
+            nev_deferred++; deferred = 1;
+        } else nev_sync_full++;
+        pthread_mutex_unlock(&ev_mu);
+    }
+    struct timespec m0, m1;
+    if (in_prefetch) clock_gettime(CLOCK_MONOTONIC, &m0);
+    if (!deferred) madvise_unit(u, 0);
     if (in_prefetch && step >= 1) {
         clock_gettime(CLOCK_MONOTONIC, &m1);
         pf_madvise_ns += (uint64_t)((m1.tv_sec - m0.tv_sec) * 1000000000LL + (m1.tv_nsec - m0.tv_nsec));
@@ -561,7 +653,7 @@ static void evict(int i) {
         if (step >= 1) { npf_gen_wasted++; pf_half_wasted[half_of_step()]++; }
         u->pf = 0;
     }
-    u->resident = 0; used -= u->bytes; nevict++;
+    used -= u->bytes; nevict++;
     q_remove(i);
 }
 
@@ -630,10 +722,11 @@ static void handle_fault_locked(uint64_t addr, uint64_t t) {
         return;
     }
     if (ui < 0 || __atomic_load_n(&U[ui].resident, __ATOMIC_ACQUIRE)) {   // header/padding, ou página de borda
+page:;
         uint64_t tp = now_us();
         load_file_range(g, pg_down(off), pg_down(off) + PG);
         load_us += now_us() - tp;
-        if (ui < 0) nunknown++;
+        if (ui < 0) nunknown++; else nfault_resident++;
         goto wake;
     }
     unit_t *u = &U[ui];
@@ -650,6 +743,7 @@ static void handle_fault_locked(uint64_t addr, uint64_t t) {
         // só o passo 0 pode ter recargas, e o simulate.py o descarta (--skip 1).
         while (used + u->bytes > budget && evict_oldest()) ;
     }
+    if (reclaim(ui)) goto page;                  // despejo pendente cancelado: as páginas da unidade ainda estão lá
     if (io_async) {
         nloads++;
         if (u->expert >= 0) { used += u->bytes; q_push(ui); }
@@ -768,6 +862,10 @@ static int init_uffd(void) {
     if (getenv("PAGER_PREFETCH_K")) prefetch_k = atoi(getenv("PAGER_PREFETCH_K"));
     if (prefetch_k < 1) prefetch_k = 1;
     if (prefetch_k > 64) prefetch_k = 64;
+    if (getenv("PAGER_PREFETCH_MIN")) prefetch_min = atof(getenv("PAGER_PREFETCH_MIN"));
+    if (prefetch_min < 0) prefetch_min = 0;
+    evict_async = getenv("PAGER_EVICT_ASYNC") ? atoi(getenv("PAGER_EVICT_ASYNC")) : io_async;
+    if (getenv("PAGER_EVICT_DELAY_US")) evict_delay_us = atoi(getenv("PAGER_EVICT_DELAY_US"));
     const char *lp = getenv("PAGER_LOG") ? getenv("PAGER_LOG") : "pager_trace.csv";
     logf_ = fopen(lp, "w");
     if (logf_) fprintf(logf_, "step,layer,expert,bytes,load_us\n");
@@ -801,11 +899,19 @@ static void report(void) {
             "%.1f faults/token) espera_total=%.1f s esperadores_pendentes=%d estouro=%llu\n",
             wait_union_gen_us / 1e3 / gen, wait_sum_gen_us / 1e3 / gen, nwaits_gen / gen,
             wait_union_us / 1e6, nw, (unsigned long long)nw_overflow);
-    fprintf(stderr, "[pager] prefetch=%s K=%d emitidos=%.1f uteis=%.1f desperdicados=%.1f por token "
-            "(geração; total %llu/%llu/%llu) sem_orcamento=%llu cb_prefetch=%.2f ms/token\n",
-            prefetch_on ? "markov" : "desligado", prefetch_k, npf_gen_issued / gen, npf_gen_useful / gen,
+    fprintf(stderr, "[pager] despejo=%s adiados=%llu resgatados=%llu esperas_madvise=%llu obsoletos=%llu "
+            "fila_cheia=%llu fila_max=%d madvise_worker=%.2f ms/token (geração) faults_em_residente=%llu "
+            "violacoes=%llu\n",
+            evict_async ? "async" : "sync", (unsigned long long)nev_deferred, (unsigned long long)nev_rescued,
+            (unsigned long long)nev_waited, (unsigned long long)nev_stale, (unsigned long long)nev_sync_full,
+            evq_max, ev_madvise_gen_ns / 1e6 / gen, (unsigned long long)nfault_resident,
+            (unsigned long long)nev_violation);
+    fprintf(stderr, "[pager] prefetch=%s K=%d min=%.3f emitidos=%.1f uteis=%.1f desperdicados=%.1f por token "
+            "(geração; total %llu/%llu/%llu) abaixo_do_limiar=%llu sem_orcamento=%llu cb_prefetch=%.2f ms/token\n",
+            prefetch_on ? "markov" : "desligado", prefetch_k, prefetch_min, npf_gen_issued / gen, npf_gen_useful / gen,
             npf_gen_wasted / gen, (unsigned long long)npf_issued, (unsigned long long)npf_useful,
-            (unsigned long long)npf_wasted, (unsigned long long)npf_skipped_budget, cb_pf_ns / 1e6 / gen);
+            (unsigned long long)npf_wasted, (unsigned long long)npf_below_min, (unsigned long long)npf_skipped_budget,
+            cb_pf_ns / 1e6 / gen);
     if (prefetch_on) {
         double h0 = step < 32 ? (double)step : 32.0, h1 = step > 32 ? (double)(step - 32) : 0.0;
         fprintf(stderr, "[pager] prefetch_metades=passos 1-32: emitidos=%.1f uteis=%.1f desperdicados=%.1f por token | "
@@ -848,14 +954,17 @@ static void markov_learn(int L, const int32_t *tok, int nused, int ntok) {
 static void markov_prefetch(int L, const int *ids, int n) {
     if (!trans || L + 1 >= emap_layers || L + 1 >= 40) return;
     uint32_t votes[4096] = {0};
+    uint64_t total = 0;
     for (int i = 0; i < n; i++) {
         const uint16_t *row = &trans[((size_t)L * emap_maxe + ids[i]) * emap_maxe];
-        for (uint64_t e = 0; e < emap_maxe; e++) votes[e] += row[e];
+        for (uint64_t e = 0; e < emap_maxe; e++) { votes[e] += row[e]; total += row[e]; }
     }
+    double thr = prefetch_min * (double)total;       // limiar de confiança (0 = K fixo)
     for (int k = 0; k < prefetch_k; k++) {           // seleção dos top-K com voto > 0
         uint64_t best = 0; uint32_t bv = 0;
         for (uint64_t e = 0; e < emap_maxe; e++) if (votes[e] > bv) { bv = votes[e]; best = e; }
         if (!bv) break;
+        if ((double)bv < thr) { npf_below_min += (uint64_t)(prefetch_k - k); break; }
         votes[best] = 0;
         int ui = emap_g[(uint64_t)(L + 1) * emap_maxe + best];
         if (ui < 0) continue;
@@ -864,6 +973,7 @@ static void markov_prefetch(int L, const int *ids, int n) {
         int ok = 1;
         while (used + u->bytes > budget) if (!evict_oldest_unmarked()) { ok = 0; break; }
         if (!ok) { npf_skipped_budget++; return; }   // nunca despeja o que o token atual já usou
+        if (reclaim(ui)) continue;                   // estava com despejo pendente: voltou sem ler o disco
         if (!submit_unit_prio(&R[u->region], ui, 1)) return;
         nloads++; npf_issued++;
         if (step >= 1) { npf_gen_issued++; pf_half_issued[half_of_step()]++; }
@@ -893,6 +1003,7 @@ static void router_layer(int L, const int *ids, int n, const int32_t *tok, int n
         uint64_t te = ns_now(); uint64_t ne = nevict;
         while (used + u->bytes > budget && evict_oldest()) ;
         uint64_t ts = ns_now();
+        if (reclaim(ui)) { if (step >= 1) { cb_evict_ns += ts - te; cb_nevict += nevict - ne; } continue; }
         nloads++; ncb_loads++;
         used += u->bytes; q_push(ui);
         submit_unit(&R[u->region], ui);
@@ -1002,6 +1113,7 @@ static void *setup_region(int fd, size_t len) {
     if (nregions == 0) {
         pthread_create(&handler_tid, NULL, handler, NULL);
         pthread_create(&reader_tid, NULL, reader, NULL);
+        if (evict_async) { pthread_t t; pthread_create(&t, NULL, evictor, NULL); }
         if (io_parallel || io_async)
             for (int i = 0; i < nworkers; i++) { pthread_t t; pthread_create(&t, NULL, io_worker, NULL); }
     }

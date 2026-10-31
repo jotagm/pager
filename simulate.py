@@ -62,7 +62,7 @@ def sim_belady(acc, budget):
         heapq.heappush(heap, (-nxt[i], k))
     return dict(hits=hits, dem=dem, pre=0, waste=0)
 
-def sim_markov(acc, budget, topk):
+def sim_markov(acc, budget, topk, min_frac=0.0):
     trans = defaultdict(Counter)                 # (l,e) -> Counter((l2,e2))
     cache, used, dem, pre, waste, hits = OrderedDict(), 0, 0, 0, 0, 0
     pref = set()                                 # pré-carregados ainda não usados
@@ -93,7 +93,9 @@ def sim_markov(acc, budget, topk):
                 for c in cur: trans[c][kk] += 1
             votes = Counter()
             for c in cur: votes.update(trans[c])
-            for kk, _ in votes.most_common(topk):
+            total = sum(votes.values())
+            for kk, v in votes.most_common(topk):
+                if v < min_frac * total: break          # limiar de confiança (0 = K fixo)
                 if kk not in cache and kk in sizes:
                     pre += sizes[kk]; insert(kk, sizes[kk]); pref.add(kk)
         i = j
@@ -105,6 +107,8 @@ def main():
     ap.add_argument("--budgets-mb", default="1024,2048,3072,4096")
     ap.add_argument("--skip", type=int, default=1, help="passos iniciais a ignorar (prompt)")
     ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--min-frac", default="",
+                    help="lista de limiares do Markov (fração dos votos da camada); mostra uma linha markov por valor")
     a = ap.parse_args()
     acc = load(a.trace, a.skip)
     if not acc: print("trace vazio"); return
@@ -117,12 +121,15 @@ def main():
           f"{'desperdício':>11} {'disco/tok':>10}")
     for bm in [float(x) for x in a.budgets_mb.split(",")]:
         budget = int(bm * 2**20)
-        for name, fn in [("lru", lambda: sim_lru(acc, budget)),
-                         ("lfu", lambda: sim_lru(acc, budget, lfu=True)),
-                         ("markov", lambda: sim_markov(acc, budget, a.topk)),
-                         ("belady", lambda: sim_belady(acc, budget))]:
+        pols = [("lru", lambda: sim_lru(acc, budget)),
+                ("lfu", lambda: sim_lru(acc, budget, lfu=True)),
+                ("markov", lambda: sim_markov(acc, budget, a.topk))]
+        for f in [float(x) for x in a.min_frac.split(",") if x]:
+            pols.append((f"mk>={f:g}", lambda f=f: sim_markov(acc, budget, a.topk, f)))
+        pols.append(("belady", lambda: sim_belady(acc, budget)))
+        for name, fn in pols:
             r = fn()
-            print(f"{bm:>8g}MB {name:>8} {r['hits']/len(acc):>6.1%} {r['dem']/ntok/1e6:>10.1f}MB "
+            print(f"{bm:>8g}MB {name:>9} {r['hits']/len(acc):>6.1%} {r['dem']/ntok/1e6:>10.1f}MB "
                   f"{r['pre']/ntok/1e6:>11.1f}MB {r['waste']/ntok/1e6:>9.1f}MB "
                   f"{(r['dem']+r['pre'])/ntok/1e6:>8.1f}MB")
         print()

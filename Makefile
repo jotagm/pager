@@ -25,6 +25,8 @@ test: all
 	  PAGER_MODE=lru PAGER_BUDGET_MB=1 PAGER_LOG=lru.csv ./test_reader fake.gguf; \
 	  unset LD_PRELOAD; \
 	done
+	# corrida do despejo adiado (v6): ver test/race.sh
+	test/race.sh ../libpager.so 6
 	python3 simulate.py test/trace.csv --budgets-mb 0.5,1,2 --skip 0
 
 clean:

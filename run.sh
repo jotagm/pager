@@ -97,6 +97,6 @@ TPS=$(grep -E "eval time" "$OUT/llama.log" | grep -v prompt | grep -oE "[0-9]+[.
   echo "scope: pico=$(awk '{printf "%.0f", $1/1048576}' "$OUT/memory.peak" 2>/dev/null || echo ?) MB" \
        "$(grep -E '^(max|oom|oom_kill) ' "$OUT/memory.events" 2>/dev/null | tr '\n' ' ')"
   grep -E "\[(pager|nopopulate)\] (passos|regiões)" "$OUT/llama.log" | tail -1 || true
-  grep -E "\[pager\] (router|espera|prefetch|prefetch_metades)=" "$OUT/llama.log" || true
+  grep -E "\[pager\] (router|espera|despejo|prefetch|prefetch_metades)=" "$OUT/llama.log" || true
 } | tee "$OUT/summary.txt"
 echo "resultados em $OUT"

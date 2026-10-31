@@ -1,0 +1,34 @@
+0.00.001.053 I llama_completion: llama backend init
+0.00.002.087 I llama_completion: load the model and apply lora adapter, if any
+[pager] modo=lru orçamento=1024 MB direct=1 io=async threads_io=4 bloco=256 KB log=/home/jota/pager-lab/results/lru-20261031-104908/trace.csv
+[pager] 733 tensores (120 de experts), 40 camadas, 256 experts/camada, alinhamento 32, dados em 10990048
+[pager] interceptado /home/jota/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22.13 GB)
+[pager] router: cb_eval instalado (sem callback anterior), 40 camadas x 256 experts
+0.00.450.511 I cmn          init: llama threadpool init, n_threads = 4
+0.00.455.556 I 
+0.00.455.643 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.455.646 I 
+0.00.456.167 I sampler seed: 4294967295
+0.00.456.181 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.00.456.188 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.00.456.189 I generate: n_ctx = 2048, n_batch = 2048, n_predict = 8, n_keep = 0
+0.00.456.190 I 
+0.16.681.852 I common_perf_print:    sampling time =       5.84 ms
+0.16.681.854 I common_perf_print:    samplers time =       1.88 ms /   105 tokens
+0.16.681.858 I common_perf_print:        load time =   12407.51 ms
+0.16.681.861 I common_perf_print: prompt eval time =   12406.68 ms /    97 tokens (  127.90 ms per token,     7.82 tokens per second)
+0.16.681.865 I common_perf_print:        eval time =    3812.66 ms /     7 runs   (  544.67 ms per token,     1.84 tokens per second)
+0.16.681.867 I common_perf_print:       total time =   16226.30 ms /   104 tokens
+0.16.681.869 I common_perf_print: unaccounted time =       1.12 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+0.16.681.870 I common_perf_print:    graphs reused =          6
+0.16.681.871 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+[pager] passos=7 cargas=6546 despejos=5472 lidos=14.15 GB io=45.0 s carga=12.5 s (1130 MB/s) io_modo=async faults_em_carga=11207 experts_residentes=1024 MB fixos=2435 MB paginas_avulsas=0
+[pager] router=ativo politica=lru callbacks=320 cb=40.31 ms/token (geração; ask=0.31 lock=0.01 trabalho=39.82: despejo=17.98 [890] despacho=0.27) cb_total=964.0 ms toques=1346 cargas_router=5028
+[pager] espera=247.6 ms/token (geração, relógio com >= 1 thread parada; soma=897.1 ms/token, 405.4 faults/token) espera_total=9.8 s esperadores_pendentes=0 estouro=0
+[pager] despejo=sync adiados=0 resgatados=0 esperas_madvise=0 obsoletos=0 fila_cheia=0 fila_max=0 madvise_worker=0.00 ms/token (geração) faults_em_residente=94 violacoes=0
+[pager] prefetch=markov K=8 min=0.000 emitidos=144.1 uteis=51.0 desperdicados=74.3 por token (geração; total 1009/357/520) abaixo_do_limiar=0 sem_orcamento=0 cb_prefetch=21.42 ms/token
+[pager] prefetch_metades=passos 1-32: emitidos=144.1 uteis=51.0 desperdicados=74.3 por token | passos 33-7: emitidos=0.0 uteis=0.0 desperdicados=0.0 por token | madvise_no_prefetch=21.04 ms/token (1004 despejos) de cb_prefetch=21.42 ms/token
