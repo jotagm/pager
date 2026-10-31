@@ -6,12 +6,16 @@
 // (camada, expert) foi tocado, lê do disco e insere com UFFDIO_COPY.
 //
 // Variáveis de ambiente:
-//   PAGER_MODE       trace | fifo            (default: trace)
+//   PAGER_MODE       trace | fifo | lru      (default: trace)
 //     trace: a cada novo token despeja todos os experts -> cada acesso vira um
 //            fault -> log = trace completo de acessos (lento, só pra gerar trace).
 //            Respeita PAGER_BUDGET_MB dentro do passo (necessário no passo do prompt).
 //     fifo : orçamento fixo de RAM pros experts, despejo por ordem de carga.
 //            (o pager só vê MISSES; sem ver hits, LRU degenera em FIFO)
+//     lru  : orçamento fixo com despejo LRU real. O "bit de acesso" vem do router do modelo: o pager
+//            intercepta llama_init_from_model e instala um cb_eval que observa ffn_moe_topk-<L>; a cada
+//            camada marca os experts escolhidos como usados e despacha a carga dos que faltam (v4)
+//   PAGER_ROUTER     1 = instala o cb_eval do router (default: 1 no modo lru, 0 nos outros)
 //   PAGER_BUDGET_MB  orçamento dos experts no modo fifo (default: 3072)
 //   PAGER_LOG        arquivo CSV de log (default: pager_trace.csv)
 //   PAGER_DIRECT     1 = lê com O_DIRECT, sem page cache (default: 1)
@@ -45,6 +49,8 @@
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "llama.h"     // llama_context_params e ggml_tensor: compilar contra o mesmo commit do llama.cpp
 
 #ifndef UFFD_USER_MODE_ONLY
 #define UFFD_USER_MODE_ONLY 1
@@ -101,7 +107,8 @@ static pthread_mutex_t setup_mu = PTHREAD_MUTEX_INITIALIZER;
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
 
 // config
-static int mode_fifo;
+static int mode_fifo;                  // 1 = orçamento fixo (fifo ou lru); 0 = trace
+static int mode_lru, router_on;
 static uint64_t budget;
 static int use_direct = 1, verbose;
 static uint64_t min_bytes;
@@ -114,6 +121,15 @@ static int io_parallel, io_async, nworkers = 4;
 static uint64_t block_bytes = 256 << 10;
 static uint64_t nwait;                // async: faults num expert que já estava em carga
 static int last_layer = -1;
+static pthread_mutex_t st_mu = PTHREAD_MUTEX_INITIALIZER;   // fila, orçamento e passo (handler x callback)
+static int *emap_g, emap_layers; static uint64_t emap_maxe;  // (camada, expert) -> unidade
+static int cb_seen, cb_last_layer = -1;
+static uint64_t ncb, cb_ns, ncb_loads, ncb_touch;
+static uint64_t cb_ask_ns, cb_lock_ns, cb_work_ns;      // decomposição do custo (só passos de geração)
+static uint64_t cb_gen_ns;                               // custo total nos passos de geração (passo >= 1)
+static uint64_t cb_evict_ns, cb_submit_ns, cb_nevict;    // dentro do trabalho: despejos e despacho
+static uint64_t ns_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ULL + t.tv_nsec; }
+static ggml_backend_sched_eval_callback prev_cb; static void *prev_ud;
 static int q_head = -1, q_tail = -1;   // FIFO de experts residentes
 static char *iobuf;
 
@@ -259,6 +275,7 @@ static int parse_gguf(int ri, int fd) {
     qsort(g->ranges, g->nranges, sizeof(range_t), cmp_range);
     fprintf(stderr, "[pager] %llu tensores (%d de experts), %d camadas, %llu experts/camada, alinhamento %u, dados em %llu\n",
             (unsigned long long)nt, nexp_t, maxl + 1, (unsigned long long)maxe, align, (unsigned long long)data);
+    if (emap && !emap_g) { emap_g = emap; emap_layers = maxl + 1; emap_maxe = maxe; emap = NULL; }
     free(T); free(emap); free(r);
     return 0;
 fail:
@@ -456,7 +473,14 @@ static int find_unit(region_t *g, uint64_t off) {
     return -1;
 }
 
+static void handle_fault_locked(uint64_t addr);
 static void handle_fault(uint64_t addr) {
+    pthread_mutex_lock(&st_mu);
+    handle_fault_locked(addr);
+    pthread_mutex_unlock(&st_mu);
+}
+
+static void handle_fault_locked(uint64_t addr) {
     region_t *g = NULL;
     for (int i = 0; i < nregions; i++)
         if (addr >= (uint64_t)R[i].base && addr < (uint64_t)R[i].base + R[i].len) { g = &R[i]; break; }
@@ -477,7 +501,7 @@ static void handle_fault(uint64_t addr) {
     }
     unit_t *u = &U[ui];
     if (u->expert >= 0) {
-        if (u->layer < last_layer) {             // camada voltou -> novo token (passo)
+        if (!cb_seen && u->layer < last_layer) { // camada voltou -> novo token (sem router; com ele, o passo vem do callback)
             step++;
             if (!mode_fifo) while (evict_oldest()) ;
         }
@@ -550,7 +574,9 @@ static int init_uffd(void) {
     LOGV("userfaultfd ok (endereço exato: %s)\n", want ? "sim" : "não");
 
     const char *m = getenv("PAGER_MODE");
-    mode_fifo = m && !strcmp(m, "fifo");
+    mode_lru = m && !strcmp(m, "lru");
+    mode_fifo = (m && !strcmp(m, "fifo")) || mode_lru;
+    router_on = getenv("PAGER_ROUTER") ? atoi(getenv("PAGER_ROUTER")) : mode_lru;
     budget = (uint64_t)(getenv("PAGER_BUDGET_MB") ? atoll(getenv("PAGER_BUDGET_MB")) : 3072) << 20;
     if (getenv("PAGER_DIRECT")) use_direct = atoi(getenv("PAGER_DIRECT"));
     io_parallel = getenv("PAGER_IO") && !strcmp(getenv("PAGER_IO"), "parallel");
@@ -565,7 +591,7 @@ static int init_uffd(void) {
     if (logf_) fprintf(logf_, "step,layer,expert,bytes,load_us\n");
     if (posix_memalign((void **)&iobuf, PG, CHUNK)) return -1;
     fprintf(stderr, "[pager] modo=%s orçamento=%llu MB direct=%d io=%s threads_io=%d bloco=%llu KB log=%s\n",
-            mode_fifo ? "fifo" : "trace", (unsigned long long)(budget >> 20), use_direct,
+            mode_lru ? "lru" : mode_fifo ? "fifo" : "trace", (unsigned long long)(budget >> 20), use_direct,
             io_async ? "async" : io_parallel ? "parallel" : "sync", (io_parallel || io_async) ? nworkers : 0,
             (unsigned long long)(io_async ? block_bytes >> 10 : 0), lp);
     return 0;
@@ -581,6 +607,97 @@ static void report(void) {
             io_async ? "async" : io_parallel ? "parallel" : "sync", (unsigned long long)nwait,
             used / 1048576.0, pinned_bytes / 1048576.0,
             (unsigned long long)nunknown);
+    double gen = step ? (double)step : 1.0;
+    fprintf(stderr, "[pager] router=%s politica=%s callbacks=%llu cb=%.2f ms/token (geração; ask=%.2f lock=%.2f "
+            "trabalho=%.2f: despejo=%.2f [%llu] despacho=%.2f) cb_total=%.1f ms toques=%llu cargas_router=%llu\n",
+            router_on ? (cb_seen ? "ativo" : "sem callbacks") : "desligado",
+            mode_lru ? "lru" : mode_fifo ? "fifo" : "trace", (unsigned long long)ncb,
+            cb_gen_ns / 1e6 / gen, cb_ask_ns / 1e6 / gen, cb_lock_ns / 1e6 / gen, cb_work_ns / 1e6 / gen,
+            cb_evict_ns / 1e6 / gen, (unsigned long long)cb_nevict, cb_submit_ns / 1e6 / gen,
+            cb_ns / 1e6, (unsigned long long)ncb_touch, (unsigned long long)ncb_loads);
+}
+
+// ---------------------------------------------------------------- router (v4): bit de acesso pelo cb_eval
+static int in_queue(int ui) { return U[ui].prev >= 0 || U[ui].next >= 0 || q_head == ui; }
+
+// Chamado com st_mu: experts da camada L escolhidos pelo router (ids[], n distintos).
+static void router_layer(int L, const int *ids, int n) {
+    if (L < cb_last_layer) {                     // camada voltou -> novo token
+        step++;
+        if (!mode_fifo) while (evict_oldest()) ;
+    }
+    cb_last_layer = L; cb_seen = 1;
+    for (int i = 0; i < n; i++) {                // 1) bit de acesso: no LRU, vai pro fim da fila
+        int ui = emap_g[(uint64_t)L * emap_maxe + ids[i]];
+        if (ui >= 0 && mode_lru && in_queue(ui)) { q_remove(ui); q_push(ui); ncb_touch++; }
+    }
+    if (!io_async) return;                       // carga antecipada só no async; nos outros, o fault carrega
+    for (int i = 0; i < n; i++) {                // 2) despacha os que faltam, antes do mul_mat_id
+        int ui = emap_g[(uint64_t)L * emap_maxe + ids[i]];
+        if (ui < 0) continue;
+        unit_t *u = &U[ui];
+        if (__atomic_load_n(&u->resident, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->loading, __ATOMIC_ACQUIRE)) continue;
+        uint64_t te = ns_now(); uint64_t ne = nevict;
+        while (used + u->bytes > budget && evict_oldest()) ;
+        uint64_t ts = ns_now();
+        nloads++; ncb_loads++;
+        used += u->bytes; q_push(ui);
+        submit_unit(&R[u->region], ui);
+        if (step >= 1) { cb_evict_ns += ts - te; cb_submit_ns += ns_now() - ts; cb_nevict += nevict - ne; }
+    }
+}
+
+static bool pager_cb(struct ggml_tensor *t, bool ask, void *ud) {
+    (void)ud;
+    uint64_t t0 = ns_now();
+    int mine = 0, L = -1;
+    if (!strncmp(t->name, "ffn_moe_topk-", 13)) {
+        L = atoi(t->name + 13);
+        mine = emap_g && L >= 0 && L < emap_layers && L < 40 && t->type == GGML_TYPE_I32;
+    }
+    bool prev_wants = prev_cb && prev_cb(t, true, prev_ud);
+    bool ret = true;
+    if (ask) {
+        ret = mine || prev_wants;
+        if (step >= 1) __atomic_add_fetch(&cb_ask_ns, ns_now() - t0, __ATOMIC_RELAXED);
+    } else {
+        if (mine) {
+            // ffn_moe_topk é uma view do argsort: [n_expert_used, n_tokens] com strides nb[0], nb[1]
+            int ids[1024], n = 0; unsigned char seen[4096] = {0};
+            for (int64_t j = 0; j < t->ne[1]; j++)
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    int e = *(const int32_t *)((const char *)t->data + i * t->nb[0] + j * t->nb[1]);
+                    if (e >= 0 && (uint64_t)e < emap_maxe && e < 4096 && !seen[e] && n < 1024) { seen[e] = 1; ids[n++] = e; }
+                }
+            uint64_t tl = ns_now();
+            pthread_mutex_lock(&st_mu);
+            uint64_t tw = ns_now();
+            router_layer(L, ids, n);
+            ncb++;
+            if (step >= 1) { cb_lock_ns += tw - tl; cb_work_ns += ns_now() - tw; }
+            pthread_mutex_unlock(&st_mu);
+        }
+        if (prev_wants) ret = prev_cb(t, false, prev_ud);
+    }
+    uint64_t dt = ns_now() - t0;
+    __atomic_add_fetch(&cb_ns, dt, __ATOMIC_RELAXED);
+    if (step >= 1) __atomic_add_fetch(&cb_gen_ns, dt, __ATOMIC_RELAXED);
+    return ret;
+}
+
+// Intercepta a criação do contexto pra encadear o cb_eval (preserva o que já existir).
+struct llama_context *llama_init_from_model(struct llama_model *model, struct llama_context_params params) {
+    static struct llama_context *(*real)(struct llama_model *, struct llama_context_params);
+    if (!real) real = (struct llama_context *(*)(struct llama_model *, struct llama_context_params))
+                      dlsym(RTLD_NEXT, "llama_init_from_model");
+    if (uffd >= 0 && router_on && emap_g && params.cb_eval != pager_cb) {
+        prev_cb = params.cb_eval; prev_ud = params.cb_eval_user_data;
+        params.cb_eval = pager_cb; params.cb_eval_user_data = NULL;
+        fprintf(stderr, "[pager] router: cb_eval instalado (%s), %d camadas x %llu experts\n",
+                prev_cb ? "encadeado com o existente" : "sem callback anterior", emap_layers,
+                (unsigned long long)emap_maxe);
+    }
+    return real(model, params);
 }
 
 static void *setup_region(int fd, size_t len) {

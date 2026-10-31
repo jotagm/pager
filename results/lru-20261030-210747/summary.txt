@@ -1,0 +1,10 @@
+modo=lru mem_max=4G budget_mb=1024 ntok=8 threads=4 io=async timeout=nenhum
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      2.08 tokens per second
+tempo total:  17.8s
+lido do disco: 12.50 GB
+major faults: 4
+RSS maximo:   3780 MB
+scope: pico=3907 MB max 0 oom 0 oom_kill 0 
+[pager] passos=7 cargas=5662 despejos=4588 lidos=12.45 GB io=39.4 s carga=11.1 s (1120 MB/s) io_modo=async faults_em_carga=11311 experts_residentes=1024 MB fixos=2435 MB paginas_avulsas=0
+[pager] router=ativo politica=lru callbacks=320 cb=20.99 ms/token (geração; ask=0.31 lock=0.01 trabalho=20.52: despejo=19.54 [1010] despacho=0.93) cb_total=820.6 ms toques=1221 cargas_router=5153

@@ -6,9 +6,10 @@
 #   ./run.sh baseline-random   -> como baseline, mais MADV_RANDOM no .gguf (sem read-around nos faults)
 #   ./run.sh trace      -> libpager em modo trace: grava o trace completo de acessos (lento)
 #   ./run.sh fifo       -> libpager com orçamento fixo e despejo FIFO
+#   ./run.sh lru        -> libpager com orçamento fixo e LRU real pelo router (cb_eval); use PAGER_IO=async
 set -euo pipefail
 
-MODE=${1:?uso: ./run.sh baseline|baseline-populate|baseline-random|trace|fifo}
+MODE=${1:?uso: ./run.sh baseline|baseline-populate|baseline-random|trace|fifo|lru}
 HERE=$(cd "$(dirname "$0")" && pwd)
 MODEL=${MODEL:?defina MODEL=/caminho/do/modelo.gguf}
 LLAMA=${LLAMA:-$HOME/llama.cpp/build/bin/llama-completion}
@@ -60,6 +61,7 @@ case "$MODE" in
   baseline-random) ENV=(LD_PRELOAD="$HERE/libnopopulate.so" NOPOP_RANDOM=1) ;;
   trace) ENV=(LD_PRELOAD="$HERE/libpager.so" PAGER_MODE=trace PAGER_LOG="$OUT/trace.csv") ;;
   fifo)  ENV=(LD_PRELOAD="$HERE/libpager.so" PAGER_MODE=fifo PAGER_BUDGET_MB="$BUDGET_MB" PAGER_LOG="$OUT/trace.csv") ;;
+  lru)   ENV=(LD_PRELOAD="$HERE/libpager.so" PAGER_MODE=lru PAGER_BUDGET_MB="$BUDGET_MB" PAGER_LOG="$OUT/trace.csv") ;;
   *) echo "modo inválido"; exit 2 ;;
 esac
 
@@ -94,6 +96,7 @@ TPS=$(grep -E "eval time" "$OUT/llama.log" | grep -v prompt | grep -oE "[0-9]+[.
   echo "RSS maximo:   ${RSS} MB"
   echo "scope: pico=$(awk '{printf "%.0f", $1/1048576}' "$OUT/memory.peak" 2>/dev/null || echo ?) MB" \
        "$(grep -E '^(max|oom|oom_kill) ' "$OUT/memory.events" 2>/dev/null | tr '\n' ' ')"
-  grep -E "\[(pager|nopopulate)\]" "$OUT/llama.log" | tail -1 || true
+  grep -E "\[(pager|nopopulate)\] (passos|regiões)" "$OUT/llama.log" | tail -1 || true
+  grep -E "\[pager\] router=" "$OUT/llama.log" | tail -1 || true
 } | tee "$OUT/summary.txt"
 echo "resultados em $OUT"

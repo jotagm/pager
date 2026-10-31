@@ -28,6 +28,13 @@ export MODEL=~/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 MEM_MAX=6G NTOK=64 ./run.sh <modo>
 ```
 
+**Router (v4).** O `libpager` intercepta `llama_init_from_model` e encadeia um `cb_eval` (preservando o que já
+existir) que observa `ffn_moe_topk-<L>` (L < 40): a cada camada, marca os experts escolhidos como usados (LRU) e
+despacha a carga dos que faltam antes do `mul_mat_id`. O passo (token) passa a vir do índice da camada. Ligado por
+padrão só em `PAGER_MODE=lru` (`PAGER_ROUTER=0/1` muda). O resumo `[pager] router=` traz o custo do callback por
+token de geração, decomposto em `ask`, `lock` e `trabalho` (despejo + despacho). O `libpager` compila contra os
+headers do llama.cpp (`LLAMA_DIR`, padrão `~/llama.cpp`), do mesmo commit que vai rodar.
+
 Modos de I/O do pager: `sync` (v1, o handler lê e copia cada fatia em sequência), `parallel` (v2, as fatias
 gate/up/down de um expert são lidas em paralelo por um pool de threads, leitura sobreposta à cópia) e `async`
 (v3, o handler despacha cada fault pro pool e volta a ler o uffd: várias cargas de experts em voo, fatias em
@@ -40,6 +47,7 @@ blocos de `PAGER_BLOCK_KB`; um segundo fault num expert em carga espera o bloco 
 | `baseline-random` | `baseline` + `MADV_RANDOM` (sem o read-around de 4 MB do kernel) |
 | `trace` | `libpager` gravando o trace completo de acessos (`results/trace-*/trace.csv`) |
 | `fifo` | `libpager` com orçamento fixo de experts (`BUDGET_MB`) e despejo FIFO |
+| `lru` | `libpager` com despejo LRU real: o "bit de acesso" vem do router do modelo (v4, use `PAGER_IO=async`) |
 
 Variáveis: `MEM_MAX` (teto do cgroup), `BUDGET_MB`, `NTOK`, `PAGER_IO=sync|parallel|async`, `PAGER_IO_THREADS`,
 `PAGER_BLOCK_KB` (async),

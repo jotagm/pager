@@ -1,9 +1,12 @@
 CFLAGS ?= -O2 -g -Wall -Wextra
+LLAMA_DIR ?= $(HOME)/llama.cpp
+# o v4 usa llama_context_params e ggml_tensor: compilar contra o mesmo commit do llama.cpp que vai rodar
+LLAMA_INC = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include
 
 all: libpager.so libnopopulate.so test/test_reader
 
-libpager.so: libpager.c
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl -lpthread
+libpager.so: libpager.c $(LLAMA_DIR)/include/llama.h
+	$(CC) $(CFLAGS) $(LLAMA_INC) -fPIC -shared -o $@ $< -ldl -lpthread
 
 libnopopulate.so: libnopopulate.c
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl
@@ -19,6 +22,7 @@ test: all
 	  PAGER_MODE=trace PAGER_LOG=trace.csv ./test_reader fake.gguf; \
 	  PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_LOG=fifo.csv ./test_reader fake.gguf; \
 	  PAGER_MODE=fifo PAGER_BUDGET_MB=1 PAGER_DIRECT=0 PAGER_LOG=fifo_nodirect.csv ./test_reader fake.gguf; \
+	  PAGER_MODE=lru PAGER_BUDGET_MB=1 PAGER_LOG=lru.csv ./test_reader fake.gguf; \
 	  unset LD_PRELOAD; \
 	done
 	python3 simulate.py test/trace.csv --budgets-mb 0.5,1,2 --skip 0
