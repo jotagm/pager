@@ -1,0 +1,10 @@
+modo=fifo mem_max=6G budget_mb=2700 ntok=64 threads=4 io=async timeout=nenhum
+cache inicial: 0.0 MB dos .gguf residentes antes de rodar
+geracao:      2.69 tokens per second
+tempo total:  36.6s
+lido do disco: 21.85 GB
+major faults: 7
+RSS maximo:   5462 MB
+scope: pico=5607 MB max 0 oom 0 oom_kill 0 
+[pager] passos=63 cargas=10566 despejos=8564 lidos=21.86 GB io=71.1 s carga=20.8 s (1052 MB/s) io_modo=async faults_em_carga=55261 experts_residentes=2700 MB fixos=2435 MB paginas_avulsas=0
+[pager] router=desligado politica=fifo callbacks=0 cb=0.00 ms/token (geração; ask=0.00 lock=0.00 trabalho=0.00: despejo=0.00 [0] despacho=0.00) cb_total=0.0 ms toques=0 cargas_router=0
